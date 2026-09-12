@@ -528,9 +528,12 @@ class Move(object):
         # new log likelihood
         old_log_likes = np.take_along_axis(old_state.log_like, subset, axis=1)
         new_log_likes = new_state.log_like
-        temp_change_log_like = new_log_likes * (accepted_temp) + old_log_likes * (
-            ~accepted_temp
-        )
+        # np.where, NOT an arithmetic blend: a REJECTED proposal with
+        # log_like = -inf gives (-inf) * False = NaN, which then poisons the
+        # walker's stored log_like (coordinates unchanged) and makes any later
+        # resume raise "The initial log_like was NaN". log_prior is already
+        # guarded below; log_like was not. (CD1-L MBH runs, 2026-09-12.)
+        temp_change_log_like = np.where(accepted_temp, new_log_likes, old_log_likes)
 
         np.put_along_axis(old_state.log_like, subset, temp_change_log_like, axis=1)
 
