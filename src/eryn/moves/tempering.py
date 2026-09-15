@@ -817,11 +817,23 @@ class TemperatureControl(object):
         new_like = compute_log_like(x_here, inds=inds, supps=supps_here, branch_supps=branch_supps_here)[0]
         # check_like = compute_log_like(x_temp, inds=inds, supps=supps, branch_supps=branch_supps_temp)
 
-        # TODO: check this!
-        # fancy paccept calculation
+        # fancy paccept calculation. Slot k proposes the PAIR
+        # (i, iperm[k]) <-> (i-1, i1perm[k]) -- the same pair the caller
+        # applies on acceptance (temperature_swaps builds idx_i/idx_i1
+        # from iperm/i1perm) -- so each rung's delta must be read at that
+        # pair's own walker. Indexing by slot position instead (the
+        # pre-2026-09-14 form, new_like[.] - old_like[.] unpermuted)
+        # mixed the temp-i delta of one proposed pair with the temp-(i-1)
+        # delta of a different one; it was exact only for the identity
+        # permutation, i.e. never on the permuting path -- a detailed-
+        # balance violation. Evaluating every pair's swap in ONE
+        # compute_log_like call stays valid because each (rung, walker)
+        # likelihood depends only on its own coordinates and data.
         beta_i = self.betas[i]
         beta_i1 = self.betas[i - 1]
-        paccept = beta_i * (new_like[1] - old_like[1]) + beta_i1 * (new_like[0] - old_like[0])
+        paccept = beta_i * (new_like[1][iperm] - old_like[1][iperm]) + beta_i1 * (
+            new_like[0][i1perm] - old_like[0][i1perm]
+        )
 
         return paccept
 
