@@ -20,8 +20,13 @@ class GroupStretchMove(GroupMove, StretchMove):
     rather than the current walkers in the ensemble.
 
     This move allows for "stretch"-like proposal to be used in Reversible Jump MCMC.
+    For periodic parameters, this move uses the randomized lift proposal from
+    :class:`StretchMove`, preserving detailed balance across periodic boundaries.
 
     Args:
+        lift_scale (double, optional): Width of the lift weights in units of the complement's
+            circular standard deviation. (default: ``2.0``)
+        lift_kmax (int, optional): Most extra turns a lift may take. (default: ``8``)
         **kwargs (dict, optional): Keyword arguments passed to :class:`GroupMove` and
             :class:`StretchMove`.
 
@@ -58,7 +63,9 @@ class GroupStretchMove(GroupMove, StretchMove):
                 information. (default: ``None``)
 
         Returns:
-            tuple: First entry is new positions. Second entry is detailed balance factors.
+            tuple: First entry is new positions. Second entry is detailed balance factors,
+                including the stretch dimension factor :math:`(D - 1) \\log z` and the
+                periodic lift correction ratio :math:`\\sum \\log [w(z r) / w(r)]`.
 
         Raises:
             ValueError: Issues with dimensionality.
@@ -68,6 +75,9 @@ class GroupStretchMove(GroupMove, StretchMove):
         self.zz = None
         random_number_generator = random if not self.use_gpu else self.xp.random
         newpos = {}
+
+        # lift widths per periodic branch, and log w(z r) - log w(r) summed by get_new_points
+        self._lift = {"log_ratio": 0.0}
 
         # iterate over branches
         for i, name in enumerate(s_all):
@@ -99,9 +109,21 @@ class GroupStretchMove(GroupMove, StretchMove):
             Ns = nwalkers
 
             # get actual compliment values
-            c_temp = self.choose_c_vals(
-                name, s, s_inds=s_inds, branch_supps=branch_supps
+            c_temp = self.xp.asarray(
+                self.choose_c_vals(
+                    name, s, s_inds=s_inds, branch_supps=branch_supps
+                )
             )
+
+            if (
+                self.periodic is not None
+                and name in self.periodic.periods
+                and len(self.periodic.periods[name]) > 0
+            ):
+                c_eval = c_temp
+                if s_inds is not None:
+                    c_eval = self.xp.where(s_inds[:, :, :, None], c_temp, self.xp.nan)
+                self._lift[name] = self.lift_widths(name, c_eval)
 
             # use stretch to get new proposals
             newpos[name] = self.get_new_points(
@@ -117,4 +139,11 @@ class GroupStretchMove(GroupMove, StretchMove):
             # adjust factors in place
             self.adjust_factors(factors, ndim, gibbs_ndim)
 
-        return newpos, factors
+        # the lift weights' ratio (after adjust_factors, which assumes (ndim - 1) log z)
+        lift_log_ratio = self._lift["log_ratio"]
+        self._lift = None
+        self._last_log_norm = None
+        if self.use_gpu and not self.return_gpu and hasattr(lift_log_ratio, "get"):
+            lift_log_ratio = lift_log_ratio.get()
+
+        return newpos, factors + lift_log_ratio
