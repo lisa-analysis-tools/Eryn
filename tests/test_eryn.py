@@ -7,7 +7,7 @@
 from eryn.ensemble import EnsembleSampler
 from eryn.state import State
 from eryn.prior import ProbDistContainer, uniform_dist
-from eryn.utils import TransformContainer
+from eryn.utils import TransformContainer, PeriodicContainer
 from eryn.moves import (
     GaussianMove,
     StretchMove,
@@ -1239,3 +1239,110 @@ class ErynTest(unittest.TestCase):
         priors_in = {(0, 1): multivariate_normal(cov=cov)}
         priors = ProbDistContainer(priors_in)
         prior_vals = priors.rvs(size=12)
+
+    def test_periodic_stretch(self):
+        from scipy import stats
+
+        # 1. Verify that calling get_new_points on periodic branch without _lift raises ValueError
+        P = 2 * np.pi
+        periodic = PeriodicContainer({"p": {"theta": P}}, key_order={"p": ("theta",)})
+        move = StretchMove(periodic=periodic)
+        s = np.zeros((1, 10, 1, 1))
+        c_temp = np.zeros((1, 10, 1, 1))
+        with self.assertRaises(ValueError) as ctx:
+            move.get_new_points("p", s, c_temp, 10, (1, 10, 1, 1), 0, np.random)
+        self.assertIn("requires lift setup in get_proposal", str(ctx.exception))
+
+        # 2. Detailed balance invariance test on periodic torus
+        rng = np.random.RandomState(42)
+        n_samples = 20000
+        x = rng.uniform(0, P, size=(1, n_samples, 1, 1))
+        c = rng.uniform(0, P, size=(1, n_samples, 1, 1))
+        newpos, factors = move.get_proposal({"p": x}, {"p": [c]}, rng)
+        y = newpos["p"]
+        self.assertTrue(np.all(y >= 0.0) and np.all(y < P))
+
+        # Flat prior -> alpha = min(1, exp(factors))
+        log_alpha = factors[0]
+        alpha = np.exp(np.clip(log_alpha, -500.0, 0.0))
+        u = rng.uniform(0, 1, size=n_samples)
+        accepted = u < alpha
+        final_pos = np.where(accepted[:, None, None], y[0], x[0]).squeeze()
+        ks_res = stats.kstest(final_pos, stats.uniform(loc=0.0, scale=P).cdf)
+        self.assertGreater(ks_res.pvalue, 0.01)
+
+        # 3. End-to-end MCMC sampling with EnsembleSampler on periodic parameters
+        def log_like(x):
+            return np.zeros(x.shape[0])
+
+        priors = {"model_0": {0: uniform_dist(0.0, P)}}
+        periodic_mcmc = PeriodicContainer({"model_0": {0: P}})
+        coords = {"model_0": rng.uniform(0, P, size=(1, 12, 1, 1))}
+        sampler = EnsembleSampler(
+            12, 1, log_like, priors, periodic=periodic_mcmc, moves=StretchMove(periodic=periodic_mcmc)
+        )
+        sampler.run_mcmc(coords, 20, progress=False)
+        chain = sampler.get_chain()["model_0"]
+        self.assertTrue(np.all(chain >= 0.0) and np.all(chain < P))
+
+    def test_periodic_group_stretch(self):
+        from scipy import stats
+
+        P = 4.0
+        periodic = PeriodicContainer({"gb": {"phi": P}}, key_order={"gb": ("phi",)})
+        rng = np.random.RandomState(123)
+        n_pool = 100
+        friends_pool = rng.uniform(0, P, size=(n_pool, 1))
+
+        class ConcreteGroupStretch(GroupStretchMove):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+
+            def find_friends(self, name, s, s_inds=None, branch_supps=None):
+                ntemps, nwalkers, nleaves, ndim = s.shape
+                idx = rng.randint(0, n_pool, size=(ntemps, nwalkers, nleaves))
+                res = friends_pool[idx]
+                if s_inds is not None:
+                    res = np.where(s_inds[:, :, :, None], res, -999.0)
+                return res
+
+        move = ConcreteGroupStretch(
+            periodic=periodic, nfriends=20, lift_scale=1.5, lift_kmax=6
+        )
+
+        # Verify proposal properties
+        s = rng.uniform(0, P, size=(1, 20, 1, 1))
+        newpos, factors = move.get_proposal({"gb": s}, rng)
+        self.assertIn("gb", newpos)
+        self.assertTrue(np.all(newpos["gb"] >= 0.0) and np.all(newpos["gb"] < P))
+        self.assertTrue(np.all(np.isfinite(factors)))
+        self.assertIsNone(move._lift)
+        self.assertIsNone(move._last_log_norm)
+
+        # Verify RJ inactive leaf masking
+        ntemps, nwalkers, nleaves = 2, 10, 4
+        s_rj = rng.uniform(0, P, size=(ntemps, nwalkers, nleaves, 1))
+        s_inds = rng.rand(ntemps, nwalkers, nleaves) > 0.5
+        s_inds[:, :, 0] = True  # Ensure at least one active leaf
+        newpos_rj, factors_rj = move.get_proposal(
+            {"gb": s_rj}, rng, s_inds_all={"gb": s_inds}
+        )
+        self.assertTrue(np.all(np.isfinite(factors_rj)))
+
+        # Invariance under uniform distribution on periodic torus
+        n_samples = 20000
+        x = rng.uniform(0, P, size=(1, n_samples, 1, 1))
+        newpos_inv, factors_inv = move.get_proposal({"gb": x}, rng)
+        y = newpos_inv["gb"]
+        log_alpha = factors_inv[0]
+        alpha = np.exp(np.clip(log_alpha, -500.0, 0.0))
+        u = rng.uniform(0, 1, size=n_samples)
+        accepted = u < alpha
+        final_pos = np.where(accepted[:, None, None], y[0], x[0]).squeeze()
+        ks_res = stats.kstest(final_pos, stats.uniform(loc=0.0, scale=P).cdf)
+        self.assertGreater(ks_res.pvalue, 0.01)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
