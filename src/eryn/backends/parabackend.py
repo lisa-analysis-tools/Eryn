@@ -396,7 +396,7 @@ class ParaBackend(object):
         return last_sample
 
     def get_evidence_estimate(
-        self, discard=0, thin=1, return_error=True, method="therodynamic", **ss_kwargs
+        self, discard=0, thin=1, return_error=True, method="thermodynamic", **ss_kwargs
     ):
         """Get an estimate of the evidence
 
@@ -438,7 +438,7 @@ class ParaBackend(object):
 
         # get log evidence and error
         if method.lower() in [
-            "therodynamic",
+            "thermodynamic",
             "thermodynamic integration",
             "thermo",
             "ti",

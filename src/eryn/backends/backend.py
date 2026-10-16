@@ -781,7 +781,7 @@ class Backend(object):
         return {name: values * thin_factor for name, values in out.items()}
 
     def get_evidence_estimate(
-        self, discard=0, thin=1, return_error=True, method="therodynamic", **ss_kwargs
+        self, discard=0, thin=1, return_error=True, method="thermodynamic", **ss_kwargs
     ):
         """Get an estimate of the evidence
 
@@ -845,7 +845,7 @@ class Backend(object):
 
         # get log evidence and error
         if method.lower() in [
-            "therodynamic",
+            "thermodynamic",
             "thermodynamic integration",
             "thermo",
             "ti",
