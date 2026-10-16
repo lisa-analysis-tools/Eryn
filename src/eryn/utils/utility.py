@@ -241,7 +241,8 @@ def stepping_stone_log_evidence(betas, logls, block_len=50, repeats=100):
         n_T = betas.shape[0]
         delta_betas = betas[1:] - betas[:-1]
         throwaways = np.any(~np.isfinite(logls), axis=1) # a safeguard against non-finite entries
-        log_ratio = logsumexp(delta_betas * logls[~throwaways, :-1], axis=0) - (n_T - 1.0)*np.log(n - np.sum(throwaways))
+        # each ratio is a mean over the retained samples: normalise each by log(n) once
+        log_ratio = logsumexp(delta_betas * logls[~throwaways, :-1], axis=0) - np.log(n - np.sum(throwaways))
         return np.sum(log_ratio), log_ratio
     
     # make sure they are the same length
@@ -254,7 +255,8 @@ def stepping_stone_log_evidence(betas, logls, block_len=50, repeats=100):
     order = np.argsort(betas)
     betas = betas[order]
     logls = logls[:, order, :]
-    logls = logls.reshape(-1, betas.shape[0])  # Get all samples per temperature
+    # Get all samples per temperature: (steps, ntemps, nwalkers) -> (steps * nwalkers, ntemps)
+    logls = np.moveaxis(logls, 1, -1).reshape(-1, betas.shape[0])
     steps = logls.shape[0]  # Get number of samples
 
     logZ, _ = calculate_stepping_stone(betas, logls)
