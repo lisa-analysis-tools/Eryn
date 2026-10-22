@@ -443,7 +443,10 @@ class DESnookerMove(RedBlueMove):
 
         """
         # adjusts in place
-        if ndims_old == ndims_new:
+        if not isinstance(factors, np.ndarray):
+            # factors on the GPU
+            ndims_new = self.xp.asarray(ndims_new)
+        if np.all(ndims_old == ndims_new):
             return
         # factors = (ndim - 1) * factors
         # So: factors_normalized = factors / (ndim - 1)
