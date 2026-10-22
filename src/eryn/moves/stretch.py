@@ -104,7 +104,10 @@ class StretchMove(RedBlueMove):
             ndims_new (int): Dimension to rescale to.
         """
         # adjusts in place
-        if ndims_old == ndims_new:
+        if not isinstance(factors, np.ndarray):
+            # factors on the GPU
+            ndims_new = self.xp.asarray(ndims_new)
+        if np.all(ndims_old == ndims_new):
             return
         logzz = factors / (ndims_old - 1.0)
         factors[:] = logzz * (ndims_new - 1.0)

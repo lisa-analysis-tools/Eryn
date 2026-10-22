@@ -70,7 +70,7 @@ class GroupMove(Move, ABC):
     ):
 
         Move.__init__(self, **kwargs)
-        self.nfriends = int(nfriends)
+        self.nfriends = None if nfriends is None else int(nfriends)
         self.n_iter_update = n_iter_update
 
         if self.n_iter_update <= 1 and not live_dangerously:
@@ -262,13 +262,13 @@ class GroupMove(Move, ABC):
 
             # need to trick stretch proposal into using the dimenionality associated
             # with Gibbs sampling if it is being used
-            gibbs_ndim = 0
-            for brn, ir in zip(branch_names_run, inds_run):
-                if ir is not None:
-                    gibbs_ndim += ir.sum()
-                else:
-                    # nleaves * ndim
-                    gibbs_ndim += np.prod(state.branches[brn].shape[-2:])
+            # only the active leaves count, shape (ntemps, nwalkers)
+            gibbs_ndim = self.get_gibbs_ndim(
+                branch_names_run,
+                inds_run,
+                inds_going_for_proposal,
+                {brn: state.branches[brn].shape[-1] for brn in branch_names_run},
+            )
 
             self.current_model = model
             self.current_state = state
