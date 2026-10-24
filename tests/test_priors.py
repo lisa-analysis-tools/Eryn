@@ -8,7 +8,9 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.stats import poisson, multivariate_normal
 
+from eryn.ensemble import EnsembleSampler
 from eryn.priors import (
+    DeltaFunction,
     Prior,
     ProbDistContainer,
     UniformDistribution,
@@ -423,3 +425,30 @@ def test_package_does_not_import_deprecated_prior_module() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == "False"
+
+
+def test_delta_function_is_a_point_mass_of_one() -> None:
+    """The log density is 0 at the peak and -inf elsewhere, never +inf."""
+    dist = DeltaFunction(2.0)
+    logp = dist.logpdf(np.array([2.0, 1.0, 2.5]))
+    np.testing.assert_array_equal(logp, [0.0, -np.inf, -np.inf])
+    np.testing.assert_array_equal(dist.rvs(3), [2.0, 2.0, 2.0])
+
+
+def test_sampler_runs_with_a_delta_function_parameter() -> None:
+    """A container holding a fixed parameter starts a sampler, which keeps it at its peak."""
+    container = ProbDistContainer(
+        {"a": UniformDistribution(0.0, 1.0), "fixed": DeltaFunction(2.0)}
+    )
+
+    def log_like(x):
+        return -0.5 * (x[0] - 0.5) ** 2 / 0.01
+
+    nwalkers = 8
+    np.random.seed(5)
+    sampler = EnsembleSampler(nwalkers, 2, log_like, {"model_0": container})
+    sampler.run_mcmc(container.rvs(size=(1, nwalkers, 1)), 20, progress=False)
+
+    chain = sampler.backend.get_chain()["model_0"]
+    np.testing.assert_array_equal(chain[..., 1], 2.0)
+    assert np.all(np.isfinite(sampler.backend.get_log_prior()))

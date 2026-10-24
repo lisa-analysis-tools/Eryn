@@ -73,9 +73,11 @@ class UniformDistribution(Prior):
     
     
 class DeltaFunction(Prior):
-    """Dirac delta function prior.
+    """Dirac delta function prior: a parameter fixed at ``peak``.
 
-    Always returns the peak value during sampling and inf density at the peak.
+    Draws always return the peak value. ``logpdf`` is 0, the log of a point mass of one, at
+    the peak and ``-inf`` elsewhere, so the parameter adds nothing to the log prior of a
+    container and a sampler can start with it.
 
     Args:
         peak (float): The delta function peak value.
@@ -112,7 +114,7 @@ class DeltaFunction(Prior):
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.where(x_arr == self.peak, self.xp.inf, -self.xp.inf)
+        out = self.xp.where(x_arr == self.peak, 0.0, -self.xp.inf)
         return self._to_device(out)
 
     def cdf(self, x: ArrayLike, **kwargs: Any) -> NDArrayLike:
