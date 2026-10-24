@@ -637,20 +637,18 @@ class Exponential(Prior):
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.full_like(x_arr, -self.xp.inf, dtype=self.xp.float64)
         mask = x_arr >= self.minimum
-        
+
         valid_x = self.xp.where(mask, x_arr, 0.0)
-        out[mask] = -(valid_x / self.mu) - self._log_mu
-        
+        out = self.xp.where(mask, -(valid_x / self.mu) - self._log_mu, np.float64(-np.inf))
+
         return self._to_device(out)
 
     def cdf(self, x: ArrayLike, **kwargs: Any) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.zeros_like(x_arr, dtype=self.xp.float64)
         mask = x_arr >= self.minimum
-        
+
         valid_x = self.xp.where(mask, x_arr, 0.0)
-        out[mask] = 1.0 - self.xp.exp(-valid_x / self.mu)
-        
+        out = self.xp.where(mask, 1.0 - self.xp.exp(-valid_x / self.mu), np.float64(0.0))
+
         return self._to_device(out)

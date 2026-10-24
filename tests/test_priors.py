@@ -12,6 +12,7 @@ from scipy.stats import kstest, poisson, multivariate_normal
 from eryn.ensemble import EnsembleSampler
 from eryn.priors import (
     DeltaFunction,
+    Exponential,
     Prior,
     ProbDistContainer,
     UniformDistribution,
@@ -486,6 +487,14 @@ def test_powerlaw_rejects_domains_without_a_monotone_map(alpha, minimum, maximum
     cannot cross 0."""
     with pytest.raises(ValueError):
         PowerLaw(alpha=alpha, minimum=minimum, maximum=maximum)
+
+
+def test_exponential_with_negative_inputs() -> None:
+    """Negative inputs give -inf density and zero CDF."""
+    dist = Exponential(2.0)
+    points = np.array([-1.0, 1.0])
+    np.testing.assert_allclose(dist.logpdf(points), [-np.inf, -0.5 - np.log(2.0)])
+    np.testing.assert_allclose(dist.cdf(points), [0.0, 1.0 - np.exp(-0.5)])
 
 
 def test_powerlaw_log_jacobian_at_zero() -> None:
