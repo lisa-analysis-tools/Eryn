@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from ..prior import ProbDistContainer
+from ..priors import ProbDistContainer
 from .mh import MHMove
 
 __all__ = ["DistributionGenerate"]

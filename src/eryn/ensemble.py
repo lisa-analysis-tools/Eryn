@@ -16,7 +16,7 @@ from .moves import (
     TemperatureControl,
 )
 from .pbar import get_progress_bar
-from .prior import ProbDistContainer
+from .priors import ProbDistContainer
 from .state import State
 from .utils import PeriodicContainer, PlotContainer
 from .utils.utility import groups_from_inds

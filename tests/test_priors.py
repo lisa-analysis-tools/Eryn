@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 import numpy as np
 from numpy.typing import NDArray
@@ -408,4 +411,15 @@ def test_probdistcontainer_silent_broadcast_caught_by_size_check() -> None:
 
     with pytest.raises(ValueError, match="expected exactly"):
         container.logpdf(samples)
-        
+
+
+def test_package_does_not_import_deprecated_prior_module() -> None:
+    """Importing the sampler and its moves must leave the deprecated eryn.prior unimported.
+
+    The check runs in a fresh interpreter, because this test module imports eryn.prior itself.
+    """
+    code = "import sys, eryn.ensemble, eryn.moves; print('eryn.prior' in sys.modules)"
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "False"

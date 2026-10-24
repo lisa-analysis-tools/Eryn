@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from ..prior import ProbDistContainer
+from ..priors import ProbDistContainer
 from .rj import ReversibleJumpMove
 
 __all__ = ["DistributionGenerateRJ"]
