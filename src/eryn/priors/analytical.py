@@ -129,6 +129,10 @@ class PowerLaw(UniformDistribution):
     Sampler space: Uniform in u = x^(alpha + 1).
     Physical space: x distributed as p(x) ~ x^alpha in [minimum, maximum].
 
+    A negative ``minimum`` needs an even integer ``alpha``: then x^alpha is non-negative and
+    u = x^(alpha + 1) is an odd power, monotone on the domain. A negative ``alpha`` then also
+    needs a domain without 0, where x^alpha diverges.
+
     Args:
         alpha (float): Power law index.
         minimum (float): Minimum bound.
@@ -151,8 +155,16 @@ class PowerLaw(UniformDistribution):
     ):
         if alpha == -1:
             raise ValueError("For alpha=-1, use the LogUniform class instead.")
-        if minimum < 0 and (alpha + 1) % 1 != 0:
-            raise ValueError("Fractional powers of negative numbers are undefined.")
+        if minimum < 0 and alpha % 2 != 0:
+            raise ValueError(
+                "A negative minimum needs an even integer alpha, so that x**alpha is "
+                f"non-negative and x**(alpha + 1) is monotone; got alpha={alpha}."
+            )
+        if minimum < 0 and alpha < 0 and maximum >= 0:
+            raise ValueError(
+                f"x**alpha diverges at 0 for alpha={alpha}, so the domain "
+                f"[{minimum}, {maximum}] must not contain 0."
+            )
 
         self.alpha = alpha
         self._power = alpha + 1.0
@@ -176,15 +188,25 @@ class PowerLaw(UniformDistribution):
         self.log_jacobian = self._jacobian
 
     def _forward(self, x_phys: NDArrayLike, **kwargs) -> NDArrayLike:
-        return x_phys ** self._power
+        x_phys = self.xp.asarray(x_phys)
+        # * sign(x)|x|^p is x^p on every valid domain and stays real for negative x.
+        return self._to_device(self.xp.sign(x_phys) * self.xp.abs(x_phys) ** self._power)
 
     def _inverse(self, u_samp: NDArrayLike, **kwargs) -> NDArrayLike:
-        return u_samp ** self._inv_power
+        u_samp = self.xp.asarray(u_samp)
+        # * The sign-aware root inverts odd powers of negative x, where u**(1/p) gives NaN.
+        return self._to_device(self.xp.sign(u_samp) * self.xp.abs(u_samp) ** self._inv_power)
 
     def _jacobian(self, x_phys: NDArrayLike, **kwargs) -> NDArrayLike:
         x_phys = self.xp.asarray(x_phys)
-        valid_x = self.xp.where(x_phys > 0, x_phys, 1.0)
-        out = self._log_abs_power + self.alpha * self.xp.log(valid_x)
+        abs_x = self.xp.abs(x_phys)
+        # ! log(1) at x = 0 keeps NumPy from warning; the second where sets the exact limit.
+        log_abs_x = self.xp.log(self.xp.where(abs_x > 0, abs_x, 1.0))
+        if self.alpha > 0:
+            limit_at_zero = -self.xp.inf
+        else:
+            limit_at_zero = 0.0 if self.alpha == 0 else self.xp.inf
+        out = self._log_abs_power + self.xp.where(abs_x > 0, self.alpha * log_abs_x, limit_at_zero)
         return self._to_device(out)
     
 

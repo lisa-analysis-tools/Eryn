@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import warnings
 
 import pytest
 import numpy as np
 from numpy.typing import NDArray
-from scipy.stats import poisson, multivariate_normal
+from scipy.stats import kstest, poisson, multivariate_normal
 
 from eryn.ensemble import EnsembleSampler
 from eryn.priors import (
@@ -452,3 +453,46 @@ def test_sampler_runs_with_a_delta_function_parameter() -> None:
     chain = sampler.backend.get_chain()["model_0"]
     np.testing.assert_array_equal(chain[..., 1], 2.0)
     assert np.all(np.isfinite(sampler.backend.get_log_prior()))
+
+
+def test_powerlaw_on_a_domain_with_negative_values() -> None:
+    """p(x) = 3 x^2 / 35 on [-2, 3]: density, draws and the transforms on both signs."""
+    dist = PowerLaw(alpha=2.0, minimum=-2.0, maximum=3.0)
+
+    x = np.array([-1.5, -0.5, 0.5, 2.5])
+    np.testing.assert_allclose(dist.pdf_physical(x), 3.0 * x**2 / 35.0, rtol=1e-12)
+    np.testing.assert_allclose(dist.inverse_transform(dist.forward_transform(x)), x, rtol=1e-12)
+
+    np.random.seed(11)
+    samples = dist.rvs_physical(20_000)
+    assert np.all((samples >= -2.0) & (samples <= 3.0))
+    assert np.any(samples < 0.0)
+    assert kstest(samples, lambda value: (value**3 + 8.0) / 35.0).pvalue > 1e-3
+
+
+def test_powerlaw_negative_alpha_on_a_negative_domain() -> None:
+    """p(x) = 1.5 x^-2 on [-3, -1], where u = 1/x is monotone."""
+    dist = PowerLaw(alpha=-2.0, minimum=-3.0, maximum=-1.0)
+    x = np.array([-2.5, -1.5, -1.1])
+    np.testing.assert_allclose(dist.pdf_physical(x), 1.5 / x**2, rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "alpha, minimum, maximum",
+    [(1.0, -1.0, 2.0), (2.5, -1.0, 2.0), (-2.0, -1.0, 2.0)],
+)
+def test_powerlaw_rejects_domains_without_a_monotone_map(alpha, minimum, maximum) -> None:
+    """Odd or fractional alpha give negative or complex densities below 0; a negative alpha
+    cannot cross 0."""
+    with pytest.raises(ValueError):
+        PowerLaw(alpha=alpha, minimum=minimum, maximum=maximum)
+
+
+def test_powerlaw_log_jacobian_at_zero() -> None:
+    """du/dx = 3 x^2 vanishes at 0, so its log is -inf there, without a NumPy warning."""
+    dist = PowerLaw(alpha=2.0, minimum=-1.0, maximum=1.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        values = dist.log_jacobian(np.array([0.0, 0.5]))
+    assert values[0] == -np.inf
+    np.testing.assert_allclose(values[1], np.log(3.0 * 0.25), rtol=1e-12)
