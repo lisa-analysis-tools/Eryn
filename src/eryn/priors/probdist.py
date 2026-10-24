@@ -3,17 +3,16 @@ from __future__ import annotations
 import inspect
 from copy import deepcopy
 from collections.abc import Mapping
-from typing import Any, Sequence, TypeVar, Dict, Tuple
+from typing import TYPE_CHECKING, Any, Sequence, TypeVar, Dict, Tuple
 import numpy as np
 from numpy.typing import NDArray
 
-try:
-    import cupy as cp # type: ignore[import]
-
-except (ModuleNotFoundError, ImportError) as e:
-    pass
-
 from ..utils.utility import NDArrayLike
+from .base import array_module, check_rng_key, resolve_backend, warn_if_jax_is_float32
+
+if TYPE_CHECKING:
+    # * For type checkers only: JAX stays optional and loads when a container first uses it.
+    import jax
 
 Element = TypeVar("Element", str, int)
 
@@ -28,6 +27,13 @@ class ProbDistContainer:
             (default: ``False``)
         return_gpu (bool, optional): If ``True``, return CuPy array. If ``False``,
             return Numpy array. (default: ``False``)
+        force_backend (str, optional): ``"cpu"``, a CUDA name or ``"jax"``; see
+            :class:`~eryn.priors.base.AbstractPrior`. The container sets this backend on
+            every prior it holds, in place; :meth:`to_backend` returns a converted copy
+            instead. (default: ``None``)
+
+    On the jax backend, :meth:`logpdf` and :meth:`rvs` (with ``rng_key``) run under
+    ``jax.jit``, ``jax.vmap`` and ``jax.grad``.
 
     Attributes:
         priors_in (dict): Dictionary with keys as int or tuple of int
@@ -46,6 +52,7 @@ class ProbDistContainer:
         priors_in: Mapping[Element | Tuple[Element, ...], Any],
         use_cupy: bool = False,
         return_gpu: bool = False,
+        force_backend: str | None = None,
     ):
         priors_in = dict(priors_in)
         self.priors_in = priors_in.copy()
@@ -61,26 +68,69 @@ class ProbDistContainer:
         # ITS direct children, so without recursion a grandchild distribution
         # keeps its original backend -- and a numpy grandchild fed cupy values
         # raises "Implicit conversion to a NumPy array is not allowed".
-        self._set_use_cupy(use_cupy)
+        self._set_backend(resolve_backend(force_backend, use_cupy))
+        if self._array_library == "jax":
+            warn_if_jax_is_float32()
 
         self._parse_priors()
         self._build_signatures()
 
-    def _set_use_cupy(self, use_cupy: bool) -> None:
-        """Set ``use_cupy`` on this container and all nested priors/containers.
+    def _set_backend(self, library: str) -> None:
+        """Set the array library on this container and all nested priors/containers.
 
-        ``use_cupy`` is a flag (``xp`` is derived from it) so this is safe to
+        The library is stored as a name (``xp`` is derived from it) so this is safe to
         call post-construction as well; nested :class:`ProbDistContainer`
         children recurse so arbitrarily deep joints switch backend together.
         """
-        self.use_cupy = bool(use_cupy)
+        self._array_library = library
         for prior in self.priors_in.values():
             if isinstance(prior, ProbDistContainer):
-                prior._set_use_cupy(use_cupy)
+                prior._set_backend(library)
+                prior.return_gpu = True
+            elif hasattr(prior, "_array_library"):
+                prior._array_library = library
                 prior.return_gpu = True
             elif hasattr(prior, "use_cupy"):
-                prior.use_cupy = use_cupy
+                # * A distribution from outside eryn that knows only the CuPy flag.
+                prior.use_cupy = library == "cupy"
                 prior.return_gpu = True
+
+    def _set_use_cupy(self, use_cupy: bool) -> None:
+        """Set NumPy or CuPy on this container and all nested priors/containers."""
+        self._set_backend(resolve_backend(None, use_cupy))
+
+    @property
+    def backend_name(self) -> str:
+        """str: Array library of the container: ``"numpy"``, ``"cupy"`` or ``"jax"``."""
+        return self._array_library
+
+    @property
+    def use_cupy(self) -> bool:
+        """bool: Whether the container computes with CuPy."""
+        return self._array_library == "cupy"
+
+    @use_cupy.setter
+    def use_cupy(self, use_cupy: bool):
+        self._set_use_cupy(use_cupy)
+
+    def to_backend(self, force_backend: str) -> ProbDistContainer:
+        """Return a deep copy of the container, and of every prior in it, on another backend.
+
+        Unlike ``force_backend`` in the constructor, which switches the given priors in
+        place, this leaves the container and its priors unchanged.
+
+        Args:
+            force_backend (str): Backend name, as for the constructor.
+
+        Returns:
+            ProbDistContainer: The converted copy.
+        """
+        library = resolve_backend(force_backend)
+        if library == "jax":
+            warn_if_jax_is_float32()
+        converted = deepcopy(self)
+        converted._set_backend(library)
+        return converted
 
     def _parse_priors(self) -> None:
         """Parse input keys, assert uniformity, and determine array shapes."""
@@ -199,12 +249,11 @@ class ProbDistContainer:
 
     @property
     def xp(self) -> Any:
-        """Return the appropriate array module (NumPy or CuPy)."""
-        if self.use_cupy:
-            if cp is None:
-                raise ImportError("CuPy is not installed but use_cupy is True.")
-            return cp
-        return np
+        """Return the array module of the backend: NumPy, CuPy or jax.numpy.
+
+        A missing CuPy or JAX raises ImportError when the container is built, not here.
+        """
+        return array_module(self._array_library)
 
     def logpdf(
         self,
@@ -273,12 +322,16 @@ class ProbDistContainer:
             prior_vals += temp_out.squeeze()
 
         if squeeze:
-            prior_vals = prior_vals[0].item()
+            # * .item() needs a concrete value, so under JAX a 0-d array is returned instead.
+            prior_vals = prior_vals[0] if self._array_library == "jax" else prior_vals[0].item()
 
-        if self.use_cupy and not self.return_gpu:
-            return prior_vals.get()
+        return self._to_output(prior_vals)
 
-        return prior_vals
+    def _to_output(self, array: NDArrayLike) -> NDArrayLike:
+        """Bring CuPy results to the host unless ``return_gpu``; other arrays pass through."""
+        if self.use_cupy and not self.return_gpu and hasattr(array, "get"):
+            return getattr(array, "get")()
+        return array
 
     def ppf(self, x: NDArray, groups: Any = None, **kwargs: Any) -> NDArrayLike:
         """Percent point function (inverse of cdf)."""
@@ -288,6 +341,7 @@ class ProbDistContainer:
         self,
         size: int | tuple[int, ...] = 1,
         keys: Sequence[str | int] | None = None,
+        rng_key: jax.Array | None = None,
         **kwargs: Any,
     ) -> NDArrayLike:
         """Generate random values according to prior distribution
@@ -301,24 +355,34 @@ class ProbDistContainer:
             size (int or tuple of ints, optional): Output size for number of generated
                 sources from prior distributions.
             keys (list, optional): List of keys related to which parameters to generate.
-                They must exactly match the input keys for the ``priors_in`` dictionary for the ``__init__`` 
-                function. If used, it will produce and output array of ``tuple(size) + (len(keys),)``. 
+                They must exactly match the input keys for the ``priors_in`` dictionary for the ``__init__``
+                function. If used, it will produce and output array of ``tuple(size) + (len(keys),)``.
+                Default is ``None``.
+            rng_key (jax.Array, optional): Key of the draws, from ``jax.random.key``,
+                required on the jax backend. Each prior draws from
+                ``jax.random.fold_in(rng_key, position)``, with its position in
+                :attr:`priors`, so equal priors give different columns. NumPy and CuPy
+                containers draw from the global random state and reject a key.
                 Default is ``None``.
 
         Returns:
             cp.ndarray or np.ndarray[``size + (self.ndim,)``]: Generated samples.
 
         Raises:
-            ValueError: If size is not an int or tuple.
+            ValueError: If size is not an int or tuple, or the jax backend gets no key.
+            TypeError: If a NumPy or CuPy container gets a key.
 
         """
         if isinstance(size, int):
             size = (size,)
         elif not isinstance(size, tuple):
             raise ValueError("Size must be an int or tuple of ints.")
+        check_rng_key(self._array_library, rng_key)
 
-        out_inds = tuple([slice(None) for _ in range(len(size))])
-        out = self.xp.zeros(size + (self.ndim,), dtype=self.xp.float64)
+        # * One float64 column per parameter, stacked once at the end: no in-place writes, so
+        # * the same code runs in JAX. Parameters left out by keys stay zero.
+        zeros = self.xp.zeros(size, dtype=self.xp.float64)
+        columns: list[Any] = [None] * self.ndim
 
         pending = [(i, inds, prior_i) for i, (inds, prior_i) in enumerate(self.priors)]
         evaluated_names = set(kwargs.keys())
@@ -346,21 +410,31 @@ class ProbDistContainer:
                 pending.append((i, inds, prior_i))
                 continue
 
-            inds_in = out_inds + (inds,)
-            deps = self._extract_dependencies(prior_i, out, kwargs)
+            deps = {}
+            for req in required:
+                if req in kwargs:
+                    deps[req] = kwargs[req]
+                elif req in self.name_to_idx:
+                    column = columns[self.name_to_idx[req]]
+                    deps[req] = zeros if column is None else column
+                else:
+                    raise ValueError(f"Conditional variable '{req}' not found.")
             all_kwargs = {**kwargs, **deps}
+            if rng_key is not None:
+                import jax
+
+                all_kwargs["rng_key"] = jax.random.fold_in(rng_key, i)
 
             safe_kwargs = self._filter_kwargs(i, "rvs", all_kwargs)
 
             samples_raw = self.xp.asarray(prior_i.rvs(size=size, **safe_kwargs))
-            
+
             if len(inds) == 1:
-                adjust_inds = out_inds + (None,)
                 expected_size = int(np.prod(size))
                 if samples_raw.shape == size:
-                    out[inds_in] = samples_raw[adjust_inds]
+                    block = samples_raw[..., None]
                 elif samples_raw.size == expected_size:
-                    out[inds_in] = samples_raw.reshape(size)[adjust_inds]
+                    block = samples_raw.reshape(size)[..., None]
                 else:
                     raise ValueError(
                         f"rvs for prior at index {int(inds[0])} returned "
@@ -372,9 +446,9 @@ class ProbDistContainer:
                 expected_shape = size + (len(inds),)
                 expected_size = int(np.prod(expected_shape))
                 if samples_raw.shape == expected_shape:
-                    out[inds_in] = samples_raw
+                    block = samples_raw
                 elif samples_raw.size == expected_size:
-                    out[inds_in] = samples_raw.reshape(expected_shape)
+                    block = samples_raw.reshape(expected_shape)
                 else:
                     raise ValueError(
                         f"rvs for prior at indices {tuple(int(v) for v in inds)} "
@@ -384,14 +458,16 @@ class ProbDistContainer:
                         f"broadcast correctly."
         )
 
+            for column_index, position in enumerate(inds):
+                columns[position] = self.xp.asarray(block[..., column_index], dtype=self.xp.float64)
+
             for idx in inds:
                 name = next((k for k, v in self.name_to_idx.items() if v == idx), None)
                 if name:
                     evaluated_names.add(name) # type: ignore
 
-        if self.use_cupy and not self.return_gpu:
-            return out.get()
-        return out
+        out = self.xp.stack([zeros if column is None else column for column in columns], axis=-1)
+        return self._to_output(out)
 
     def reset_key_order(self, new_key_order: list[int] | list[str]) -> None:
         """Resets the key order to a new key order and reshuffles the prior to match the new key order.

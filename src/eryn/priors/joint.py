@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from typing import Callable, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike
 from ..utils.utility import NDArrayLike
 
 from .base import AbstractPrior
+
+if TYPE_CHECKING:
+    # * For type checkers only: JAX stays optional and loads when a prior first uses it.
+    import jax
 
 
 class JointPrior(AbstractPrior):
@@ -24,6 +28,7 @@ class JointPrior(AbstractPrior):
         forward_transform_nd: Callable[..., NDArrayLike] | None = None,
         inverse_transform_nd: Callable[..., NDArrayLike] | None = None,
         log_jacobian_nd: Callable[..., NDArrayLike] | None = None,
+        force_backend: str | None = None,
     ):
         """Main joint prior constructor for N-dimensional parameter spaces.
 
@@ -38,11 +43,13 @@ class JointPrior(AbstractPrior):
             forward_transform_nd (callable, optional): Transform from physical to sampling space. (default: ``None``)
             inverse_transform_nd (callable, optional): Transform from sampling to physical space. (default: ``None``)
             log_jacobian_nd (callable, optional): Log-determinant of the Jacobian matrix. (default: ``None``)
-                
+            force_backend (str, optional): ``"cpu"``, a CUDA name or ``"jax"``; see
+                :class:`~eryn.priors.base.AbstractPrior`. (default: ``None``)
+
         Raises:
             ValueError: If names sequence is empty, or lengths of provided metadata lists mismatch.
         """
-        super().__init__(use_cupy=use_cupy, return_gpu=return_gpu)
+        super().__init__(use_cupy=use_cupy, return_gpu=return_gpu, force_backend=force_backend)
 
         if not names:
             raise ValueError("Joint priors require a sequence of parameter names.")
@@ -283,6 +290,9 @@ class JointPrior(AbstractPrior):
 class MultivariateGaussian(JointPrior):
     """N-dimensional Multivariate Gaussian Prior.
 
+    The mean, the covariance and the matrices derived from them are computed once on the
+    host in float64 NumPy, whatever the backend, and served as arrays of the backend.
+
     Args:
         names (list of str): Names associated with parameters.
         mu (ArrayLike): Mean vector.
@@ -291,6 +301,8 @@ class MultivariateGaussian(JointPrior):
         units (list of str, optional): Strings describing parameter units. (default: ``None``)
         use_cupy (bool, optional): If ``True``, uses CuPy for GPU acceleration. (default: ``False``)
         return_gpu (bool, optional): If ``True``, returns GPU arrays. (default: ``False``)
+        force_backend (str, optional): ``"cpu"``, a CUDA name or ``"jax"``; see
+            :class:`~eryn.priors.base.AbstractPrior`. (default: ``None``)
     """
 
     def __init__(
@@ -302,49 +314,78 @@ class MultivariateGaussian(JointPrior):
         units: Sequence[str | None] | None = None,
         use_cupy: bool = False,
         return_gpu: bool = False,
+        force_backend: str | None = None,
     ):
         super().__init__(
-            names=names, 
+            names=names,
             latex_labels=latex_labels,
             units=units,
-            use_cupy=use_cupy, 
-            return_gpu=return_gpu
+            use_cupy=use_cupy,
+            return_gpu=return_gpu,
+            force_backend=force_backend,
         )
 
-        self.mu = self.xp.asarray(mu, dtype=self.xp.float64)
-        self.cov = self.xp.asarray(cov, dtype=self.xp.float64)
+        # * Host precompute: jax.numpy.linalg returns NaN where NumPy raises LinAlgError.
+        mean = np.asarray(_to_host(mu), dtype=np.float64)
+        covariance = np.asarray(_to_host(cov), dtype=np.float64)
 
-        if self.mu.shape != (self.num_vars,):
+        if mean.shape != (self.num_vars,):
             raise ValueError(f"'mu' must have shape ({self.num_vars},).")
-        if self.cov.shape != (self.num_vars, self.num_vars):
+        if covariance.shape != (self.num_vars, self.num_vars):
             raise ValueError(f"'cov' must have shape ({self.num_vars}, {self.num_vars}).")
 
-        if not self.xp.allclose(self.cov, self.cov.T):
+        if not np.allclose(covariance, covariance.T):
             raise ValueError("Covariance matrix must be symmetric.")
 
         try:
-            self.prec = self.xp.linalg.inv(self.cov)
-        except self.xp.linalg.LinAlgError:
+            precision = np.linalg.inv(covariance)
+        except np.linalg.LinAlgError:
             raise ValueError("Covariance matrix is singular and cannot be inverted.")
 
-        sign, logdet = self.xp.linalg.slogdet(self.cov)
+        sign, logdet = np.linalg.slogdet(covariance)
         if sign <= 0:
             raise ValueError("Covariance matrix is not positive definite.")
-            
-        self._log_norm = -0.5 * (self.num_vars * self.xp.log(2.0 * self.xp.pi) + logdet)
-        self.cholesky_lower = self.xp.linalg.cholesky(self.cov)
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+        self._mu_host = mean
+        self._cov_host = covariance
+        self._prec_host = precision
+        self._cholesky_lower_host = np.linalg.cholesky(covariance)
+        self._log_norm = -0.5 * (self.num_vars * np.log(2.0 * np.pi) + logdet)
+
+    @property
+    def mu(self) -> NDArrayLike:
+        """Mean vector, as an array of the backend."""
+        return self.xp.asarray(self._mu_host)
+
+    @property
+    def cov(self) -> NDArrayLike:
+        """Covariance matrix, as an array of the backend."""
+        return self.xp.asarray(self._cov_host)
+
+    @property
+    def prec(self) -> NDArrayLike:
+        """Precision matrix, the inverse covariance, as an array of the backend."""
+        return self.xp.asarray(self._prec_host)
+
+    @property
+    def cholesky_lower(self) -> NDArrayLike:
+        """Lower Cholesky factor of the covariance, as an array of the backend."""
+        return self.xp.asarray(self._cholesky_lower_host)
+
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
+        """Draw samples; the jax backend needs ``rng_key``, a ``jax.random`` key."""
         if isinstance(size, int):
             size = (size,)
 
-        z = self.xp.random.normal(0.0, 1.0, size=(*size, self.num_vars))
-        samples = self.mu + self.xp.einsum("ij,...j->...i", self.cholesky_lower, z)
+        standard_draws = self._random_normal(0.0, 1.0, (*size, self.num_vars), rng_key)
+        samples = self.mu + self.xp.einsum("ij,...j->...i", self.cholesky_lower, standard_draws)
         return self._to_device(samples)
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        
+
         if x_arr.shape[-1] != self.num_vars:
             raise ValueError(
                 f"Expected last dimension of x to be {self.num_vars}, got {x_arr.shape[-1]}"
@@ -354,3 +395,8 @@ class MultivariateGaussian(JointPrior):
         quadratic_term = self.xp.einsum("...i,ij,...j->...", diff, self.prec, diff)
         out = -0.5 * quadratic_term + self._log_norm
         return self._to_device(out)
+
+
+def _to_host(values: ArrayLike) -> ArrayLike:
+    """Return CuPy arrays as NumPy arrays, which NumPy will not convert implicitly."""
+    return getattr(values, "get")() if hasattr(values, "get") else values

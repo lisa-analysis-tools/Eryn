@@ -7,12 +7,16 @@ as well as any other prior for which the user can provide a logpdf and rvs metho
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import ArrayLike
 
 from ..utils.utility import NDArrayLike
 from .base import Prior
+
+if TYPE_CHECKING:
+    # * For type checkers only: JAX stays optional and loads when a prior first uses it.
+    import jax
 
 ANGLE_SAFE = 1e-12
 
@@ -47,14 +51,17 @@ class UniformDistribution(Prior):
             **kwargs,
         )
 
-        self.pdf_val = 1.0 / self.width 
-        self.logpdf_val = self.xp.log(self.pdf_val)
+        self.pdf_val = 1.0 / self.width
+        # * Host constant in float64 NumPy, whatever the backend, so to_backend needs no rebuild.
+        self.logpdf_val = np.log(self.pdf_val)
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
         if isinstance(size, int):
             size = (size,)
 
-        samples = self.xp.random.uniform(self.minimum, self.maximum, size=size)
+        samples = self._random_uniform(self.minimum, self.maximum, size, rng_key)
         return self._to_device(samples)
 
     def pdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
@@ -64,10 +71,9 @@ class UniformDistribution(Prior):
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.full_like(x_arr, -self.xp.inf, dtype=self.xp.float64)
-
         mask = (x_arr >= self.minimum) & (x_arr <= self.maximum)
-        out[mask] = self.logpdf_val
+        # * where instead of a masked write, which JAX arrays do not allow.
+        out = self.xp.where(mask, self.logpdf_val, -self.xp.inf)
 
         return self._to_device(out)
     
@@ -106,9 +112,13 @@ class DeltaFunction(Prior):
         )
         self.peak = peak
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
         if isinstance(size, int):
             size = (size,)
+        # * A fixed value needs no key, even on the jax backend.
+        self._check_rng_key(rng_key, needed=False)
         samples = self.xp.full(size, self.peak, dtype=self.xp.float64)
         return self._to_device(samples)
 
@@ -518,10 +528,12 @@ class Gaussian(Prior):
         self.sigma = sigma
         self._log_norm = 0.5 * np.log(2.0 * np.pi * self.sigma**2)
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
         if isinstance(size, int):
             size = (size,)
-        samples = self.xp.random.normal(loc=self.mu, scale=self.sigma, size=size)
+        samples = self._random_normal(self.mu, self.sigma, size, rng_key)
         return self._to_device(samples)
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
@@ -569,27 +581,28 @@ class LogNormal(Prior):
         self.sigma = sigma
         self._log_sqrt_2pi = np.log(np.sqrt(2.0 * np.pi))
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
         if isinstance(size, int):
             size = (size,)
-        samples = self.xp.random.lognormal(mean=self.mu, sigma=self.sigma, size=size)
+        samples = self._random_lognormal(self.mu, self.sigma, size, rng_key)
         return self._to_device(samples)
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.full_like(x_arr, -self.xp.inf, dtype=self.xp.float64)
         mask = x_arr > self.minimum
-        
+
         valid_x = self.xp.where(mask, x_arr, 1.0)
         log_x = self.xp.log(valid_x)
-        
+
         log_prob = (
             -0.5 * ((log_x - self.mu) / self.sigma) ** 2
             - self.xp.log(valid_x * self.sigma)
             - self._log_sqrt_2pi
         )
-        out[mask] = log_prob[mask]
-        
+        out = self.xp.where(mask, log_prob, np.float64(-np.inf))
+
         return self._to_device(out)
 
 
@@ -629,10 +642,12 @@ class Exponential(Prior):
         self.mu = mu
         self._log_mu = np.log(self.mu)
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
         if isinstance(size, int):
             size = (size,)
-        samples = self.xp.random.exponential(scale=self.mu, size=size)
+        samples = self._random_exponential(self.mu, size, rng_key)
         return self._to_device(samples)
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:

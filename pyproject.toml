@@ -66,6 +66,10 @@ optional-dependencies.doc = [
   "corner"
 ]
 
+optional-dependencies.jax = [
+  "jax",                                   # priors on force_backend="jax"; imported only when used
+]
+
 optional-dependencies.testing = [
   "matplotlib",
   "corner",

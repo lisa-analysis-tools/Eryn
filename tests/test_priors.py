@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import warnings
+from typing import TYPE_CHECKING
 
 import pytest
 import numpy as np
@@ -27,6 +28,9 @@ from eryn.priors import (
 )
 from eryn.prior import uniform_dist
 from eryn.utils import PeriodicContainer, TransformContainer
+
+if TYPE_CHECKING:
+    import jax
 
 
 def test_deprecated_uniform_dist() -> None:
@@ -497,6 +501,20 @@ def test_exponential_with_negative_inputs() -> None:
     np.testing.assert_allclose(dist.cdf(points), [0.0, 1.0 - np.exp(-0.5)])
 
 
+def test_missing_cupy_raises_import_error() -> None:
+    """Without CuPy, asking for it fails at construction with ImportError."""
+    try:
+        import cupy  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("CuPy is installed")
+    with pytest.raises(ImportError, match="needs cupy"):
+        UniformDistribution(0.0, 1.0, use_cupy=True)
+    with pytest.raises(ImportError, match="needs cupy"):
+        ProbDistContainer({"a": UniformDistribution(0.0, 1.0)}, force_backend="cuda12x")
+
+
 def test_powerlaw_log_jacobian_at_zero() -> None:
     """du/dx = 3 x^2 vanishes at 0, so its log is -inf there, without a NumPy warning."""
     dist = PowerLaw(alpha=2.0, minimum=-1.0, maximum=1.0)
@@ -505,3 +523,13 @@ def test_powerlaw_log_jacobian_at_zero() -> None:
         values = dist.log_jacobian(np.array([0.0, 0.5]))
     assert values[0] == -np.inf
     np.testing.assert_allclose(values[1], np.log(3.0 * 0.25), rtol=1e-12)
+
+
+class ShiftedGaussian(Prior):
+    """b ~ N(a, 1): a conditional prior written once for every backend."""
+
+    def rvs(self, size=(1,), a=0.0, rng_key: jax.Array | None = None, **kwargs):
+        return self._to_device(self._random_normal(a, 1.0, size, rng_key))
+
+    def logpdf(self, x, a=0.0, **kwargs):
+        return self._to_device(-0.5 * (self.xp.asarray(x) - a) ** 2 - 0.5 * np.log(2.0 * np.pi))

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 from numpy.typing import ArrayLike
 
 from ..utils.utility import NDArrayLike
 from .base import Prior
+
+if TYPE_CHECKING:
+    # * For type checkers only: JAX stays optional and loads when a prior first uses it.
+    import jax
 
 
 class DiscreteUniform(Prior):
@@ -59,20 +65,22 @@ class DiscreteUniform(Prior):
         self.n_states = self.max_int - self.min_int + 1
         self._logpdf_val = -np.log(self.n_states)
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
         if isinstance(size, int):
             size = (size,)
-            
-        samples = self.xp.random.randint(self.min_int, self.max_int + 1, size=size)
+
+        samples = self._random_integers(self.min_int, self.max_int + 1, size, rng_key)
         samples = samples.astype(self.xp.float64)
         return self._to_device(samples)
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.full_like(x_arr, -np.inf, dtype=self.xp.float64)
-        
+
         mask = (x_arr >= self.min_int) & (x_arr <= self.max_int) & (self.xp.round(x_arr) == x_arr)
-        out[mask] = self._logpdf_val
+        # * where instead of a masked write, which JAX arrays do not allow.
+        out = self.xp.where(mask, self._logpdf_val, np.float64(-np.inf))
         return self._to_device(out)
 
     logpmf = logpdf
@@ -168,35 +176,45 @@ class PoissonDistribution(Prior):
         self.lam = lam
         self._log_lam = np.log(self.lam)
 
-        # Resolve log-gamma function once at init
+        # * Fails at construction when the backend's ln Gamma is missing.
+        _ = self._gammaln
+
+    @property
+    def _gammaln(self):
+        """ln Gamma of the backend, looked up on use so that ``to_backend`` stays correct."""
+        if self.backend_name == "jax":
+            from jax.scipy.special import gammaln
+
+            return gammaln
         if self.use_cupy:
             try:
                 from cupyx.scipy.special import gammaln # type: ignore[import]
-                self._gammaln = gammaln
             except ImportError:
                 raise ImportError(
                     "The Poisson prior requires 'cupyx' for the gammaln function "
                     "when use_cupy=True. Please install cupyx."
                 )
-        else:
-            from scipy.special import gammaln
-            self._gammaln = gammaln
+            return gammaln
+        from scipy.special import gammaln
 
-    def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
+        return gammaln
+
+    def rvs(
+        self, size: int | tuple[int, ...] = (1,), rng_key: jax.Array | None = None, **kwargs
+    ) -> NDArrayLike:
         if isinstance(size, int):
             size = (size,)
-            
-        samples = self.xp.random.poisson(lam=self.lam, size=size).astype(self.xp.float64)
+
+        samples = self._random_poisson(self.lam, size, rng_key).astype(self.xp.float64)
         return self._to_device(samples)
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.full_like(x_arr, -np.inf, dtype=self.xp.float64)
-        
+
         mask = (x_arr >= 0) & (self.xp.round(x_arr) == x_arr)
         valid_x = self.xp.where(mask, x_arr, 0.0)
-        
+
         log_prob = valid_x * self._log_lam - self.lam - self._gammaln(valid_x + 1.0)
-        
-        out[mask] = log_prob[mask]
+
+        out = self.xp.where(mask, log_prob, np.float64(-np.inf))
         return self._to_device(out)

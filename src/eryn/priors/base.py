@@ -7,19 +7,164 @@ seamless transformations between physical and sampling parameter spaces.
 
 from __future__ import annotations
 
+import functools
+import importlib
 import inspect
+import math
+import types
 import warnings
 from copy import deepcopy
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from numpy.typing import ArrayLike
 from ..utils.utility import NDArrayLike
 
-try:
-    import cupy as _CUPY  # type: ignore[import]
-except ImportError:
-    _CUPY = None
+if TYPE_CHECKING:
+    # * For type checkers only: JAX stays optional and loads when a prior first uses it.
+    import jax
+
+# * Names accepted by ``force_backend``, as LISA Analysis Tools modules spell them, and the
+# * array library behind each.
+BACKEND_LIBRARIES = {
+    "cpu": "numpy",
+    "numpy": "numpy",
+    "cuda": "cupy",
+    "cuda11x": "cupy",
+    "cuda12x": "cupy",
+    "cuda13x": "cupy",
+    "gpu": "cupy",
+    "cupy": "cupy",
+    "jax": "jax",
+}
+_ARRAY_MODULE_NAMES = {"numpy": "numpy", "cupy": "cupy", "jax": "jax.numpy"}
+
+
+@functools.cache
+def array_module(library: str) -> types.ModuleType:
+    """Return the array module of a library: numpy, cupy or jax.numpy.
+
+    Priors store the library name and look the module up here, because an array module
+    stored on an instance breaks ``copy.deepcopy`` and ``pickle``.
+
+    Args:
+        library (str): ``"numpy"``, ``"cupy"`` or ``"jax"``.
+
+    Returns:
+        module: The array module.
+    """
+    return importlib.import_module(_ARRAY_MODULE_NAMES[library])
+
+
+def resolve_backend(force_backend: str | None = None, use_cupy: bool = False) -> str:
+    """Return the array library behind a backend name, after checking that it imports.
+
+    Args:
+        force_backend (str, optional): A key of :data:`BACKEND_LIBRARIES`: ``"cpu"`` or
+            ``"numpy"`` for NumPy, a CUDA name or ``"cupy"`` for CuPy, ``"jax"`` for
+            jax.numpy. (default: ``None``, which follows ``use_cupy``)
+        use_cupy (bool, optional): Older spelling of ``force_backend="cupy"``.
+            (default: ``False``)
+
+    Returns:
+        str: ``"numpy"``, ``"cupy"`` or ``"jax"``.
+
+    Raises:
+        ValueError: If the name is unknown, or both arguments are given.
+        ImportError: If the array library is not installed.
+    """
+    if force_backend is None:
+        library = "cupy" if use_cupy else "numpy"
+    elif use_cupy:
+        raise ValueError("Give either use_cupy or force_backend, not both.")
+    elif force_backend in BACKEND_LIBRARIES:
+        library = BACKEND_LIBRARIES[force_backend]
+    else:
+        raise ValueError(
+            f"Unknown backend {force_backend!r}; expected one of {sorted(BACKEND_LIBRARIES)}."
+        )
+    try:
+        array_module(library)
+    except ImportError as error:
+        raise ImportError(
+            f"The {force_backend or library!r} backend needs {library}, which is not installed."
+        ) from error
+    return library
+
+
+def require_rng_key(rng_key: jax.Array | None) -> jax.Array:
+    """Return the key of a jax draw; jax has no global random state to fall back on.
+
+    Args:
+        rng_key (jax.Array or None): The key given to ``rvs``, from ``jax.random.key``.
+
+    Returns:
+        jax.Array: The key.
+
+    Raises:
+        ValueError: If no key is given.
+    """
+    if rng_key is None:
+        raise ValueError("Draws on the jax backend need an explicit rng_key (a jax.random key).")
+    return rng_key
+
+
+def reject_rng_key(library: str, rng_key: jax.Array | None) -> None:
+    """Raise if a NumPy or CuPy draw gets a key.
+
+    Those draws come from the global random state of their library, so a key would promise
+    a reproducibility that they do not have.
+
+    Args:
+        library (str): ``"numpy"`` or ``"cupy"``.
+        rng_key (jax.Array or None): The key given to ``rvs``.
+
+    Raises:
+        TypeError: If a key is given.
+    """
+    if rng_key is not None:
+        raise TypeError(
+            f"rng_key applies to the jax backend only; {library} priors draw from the "
+            "global random state of their library."
+        )
+
+
+def check_rng_key(library: str, rng_key: jax.Array | None, needed: bool = True) -> None:
+    """Raise unless ``rng_key`` fits the array library.
+
+    A jax draw needs a key (see :func:`require_rng_key`), and a NumPy or CuPy draw takes
+    none (see :func:`reject_rng_key`).
+
+    Args:
+        library (str): ``"numpy"``, ``"cupy"`` or ``"jax"``.
+        rng_key (jax.Array or None): The key given to ``rvs``, from ``jax.random.key``.
+        needed (bool, optional): Whether the jax draws need a key; a fixed value does not.
+            (default: ``True``)
+
+    Raises:
+        ValueError: If the jax backend needs a key and gets none.
+        TypeError: If a NumPy or CuPy object gets a key.
+    """
+    if library != "jax":
+        reject_rng_key(library, rng_key)
+    elif needed:
+        require_rng_key(rng_key)
+
+
+def warn_if_jax_is_float32() -> None:
+    """Warn when JAX computes in float32, since eryn priors expect float64.
+
+    eryn never switches ``jax_enable_x64`` itself, because the setting holds for the whole
+    process. Under the default warning filters the warning shows once.
+    """
+    import jax
+
+    if not jax.config.jax_enable_x64:
+        warnings.warn(
+            "JAX computes in float32 because jax_enable_x64 is off, but eryn priors expect "
+            "float64. Call jax.config.update('jax_enable_x64', True) before building priors.",
+            UserWarning,
+        )
 
 
 class PriorException(Exception):
@@ -32,31 +177,157 @@ class AbstractPrior:
 
     Handles device resolution, automatic dependency inference, and metadata strings.
 
+    The backend is chosen when the prior is built and stored as the name of its array
+    library, so the prior stays deepcopy- and pickle-safe; :attr:`xp` looks the module up.
+    On the jax backend every method runs under ``jax.jit``, ``jax.vmap`` and ``jax.grad``,
+    and ``rvs`` draws from an explicit ``rng_key``.
+
     Args:
-        use_cupy (bool, optional): If ``True``, uses CuPy for GPU acceleration.
-            (default: ``False``)
-        return_gpu (bool, optional): If ``True``, returns GPU arrays when 
+        use_cupy (bool, optional): If ``True``, uses CuPy for GPU acceleration; the same as
+            ``force_backend="cupy"``. (default: ``False``)
+        return_gpu (bool, optional): If ``True``, returns GPU arrays when
             ``use_cupy`` is ``True``. (default: ``False``)
+        force_backend (str, optional): ``"cpu"`` (NumPy), a CUDA name such as ``"cuda12x"``
+            (CuPy) or ``"jax"``; see :data:`BACKEND_LIBRARIES`. (default: ``None``, NumPy
+            unless ``use_cupy``)
 
     """
 
-    def __init__(self, use_cupy: bool = False, return_gpu: bool = False):
-        if use_cupy and _CUPY is None:
-            raise ImportError("use_cupy is True, but CuPy is not installed.")
-        self.use_cupy = use_cupy
+    def __init__(
+        self, use_cupy: bool = False, return_gpu: bool = False, force_backend: str | None = None
+    ):
+        self._array_library = resolve_backend(force_backend, use_cupy)
+        if self._array_library == "jax":
+            warn_if_jax_is_float32()
         self.return_gpu = return_gpu
 
         self._infer_dependencies()
 
     @property
-    def xp(self):
-        """numpy or cupy, resolved from ``use_cupy`` (kept as a flag so the
-        prior remains deepcopy/pickle-safe -- storing the module directly
-        as an instance attribute breaks copy.deepcopy of settings trees
-        that contain priors). The module is imported once at import time
-        and cached in a module-level global, so this is a cheap lookup.
+    def backend_name(self) -> str:
+        """str: Array library of the prior: ``"numpy"``, ``"cupy"`` or ``"jax"``."""
+        return self._array_library
+
+    @property
+    def xp(self) -> types.ModuleType:
+        """numpy, cupy or jax.numpy, looked up from the stored library name.
+
+        The module is never stored on the instance, which would break ``copy.deepcopy`` of
+        settings trees that contain priors, and ``pickle``.
         """
-        return _CUPY if self.use_cupy else np
+        return array_module(self._array_library)
+
+    @property
+    def use_cupy(self) -> bool:
+        """bool: Whether the prior computes with CuPy."""
+        return self._array_library == "cupy"
+
+    @use_cupy.setter
+    def use_cupy(self, use_cupy: bool):
+        # * Kept so that containers and user code can still switch CuPy on and off.
+        self._array_library = resolve_backend(None, use_cupy)
+
+    def to_backend(self, force_backend: str) -> AbstractPrior:
+        """Return a deep copy of the prior on another backend.
+
+        Args:
+            force_backend (str): Backend name, as for the constructor.
+
+        Returns:
+            AbstractPrior: The copy; the prior itself is unchanged.
+        """
+        library = resolve_backend(force_backend)
+        if library == "jax":
+            warn_if_jax_is_float32()
+        converted = deepcopy(self)
+        converted._array_library = library
+        return converted
+
+    def _check_rng_key(self, rng_key: jax.Array | None, needed: bool = True) -> None:
+        """Raise unless ``rng_key`` fits the backend; see :func:`check_rng_key`."""
+        check_rng_key(self._array_library, rng_key, needed)
+
+    # * The draw helpers below keep the exact xp.random calls of NumPy and CuPy, so their
+    # * seeded random streams do not change; only the jax backend takes rng_key.
+
+    def _random_uniform(
+        self,
+        low: float | NDArrayLike,
+        high: float | NDArrayLike,
+        size: tuple[int, ...],
+        rng_key: jax.Array | None = None,
+    ) -> NDArrayLike:
+        if self._array_library == "jax":
+            import jax
+
+            return jax.random.uniform(require_rng_key(rng_key), size, minval=low, maxval=high)
+        reject_rng_key(self._array_library, rng_key)
+        return self.xp.random.uniform(low, high, size=size)
+
+    def _random_normal(
+        self,
+        loc: float | NDArrayLike,
+        scale: float | NDArrayLike,
+        size: tuple[int, ...],
+        rng_key: jax.Array | None = None,
+    ) -> NDArrayLike:
+        if self._array_library == "jax":
+            import jax
+
+            return loc + scale * jax.random.normal(require_rng_key(rng_key), size)
+        reject_rng_key(self._array_library, rng_key)
+        return self.xp.random.normal(loc, scale, size=size)
+
+    def _random_lognormal(
+        self,
+        mean: float | NDArrayLike,
+        sigma: float | NDArrayLike,
+        size: tuple[int, ...],
+        rng_key: jax.Array | None = None,
+    ) -> NDArrayLike:
+        if self._array_library == "jax":
+            import jax
+
+            return self.xp.exp(mean + sigma * jax.random.normal(require_rng_key(rng_key), size))
+        reject_rng_key(self._array_library, rng_key)
+        return self.xp.random.lognormal(mean=mean, sigma=sigma, size=size)
+
+    def _random_exponential(
+        self,
+        scale: float | NDArrayLike,
+        size: tuple[int, ...],
+        rng_key: jax.Array | None = None,
+    ) -> NDArrayLike:
+        if self._array_library == "jax":
+            import jax
+
+            return scale * jax.random.exponential(require_rng_key(rng_key), size)
+        reject_rng_key(self._array_library, rng_key)
+        return self.xp.random.exponential(scale=scale, size=size)
+
+    def _random_integers(
+        self, low: int, high: int, size: tuple[int, ...], rng_key: jax.Array | None = None
+    ) -> NDArrayLike:
+        """Integers in [low, high), as ``numpy.random.randint`` draws them."""
+        if self._array_library == "jax":
+            import jax
+
+            return jax.random.randint(require_rng_key(rng_key), size, low, high)
+        reject_rng_key(self._array_library, rng_key)
+        return self.xp.random.randint(low, high, size=size)
+
+    def _random_poisson(
+        self,
+        lam: float | NDArrayLike,
+        size: tuple[int, ...],
+        rng_key: jax.Array | None = None,
+    ) -> NDArrayLike:
+        if self._array_library == "jax":
+            import jax
+
+            return jax.random.poisson(require_rng_key(rng_key), lam, size)
+        reject_rng_key(self._array_library, rng_key)
+        return self.xp.random.poisson(lam=lam, size=size)
 
     def _infer_dependencies(self):
         """Automatically infer dependencies from subclass signatures.
@@ -66,7 +337,7 @@ class AbstractPrior:
         evaluation.
         """
         deps = set()
-        reserved_kwargs = {"self", "x", "size", "rng", "random_state", "kwargs", "args"}
+        reserved_kwargs = {"self", "x", "size", "rng", "rng_key", "random_state", "kwargs", "args"}
 
         for method_name in ("logpdf", "rvs"):
             if method_name not in self.__class__.__dict__:
@@ -155,6 +426,7 @@ class Prior(AbstractPrior):
         forward_transform: Callable[..., NDArrayLike] | None = None,
         inverse_transform: Callable[..., NDArrayLike] | None = None,
         log_jacobian: Callable[..., NDArrayLike] | None = None,
+        force_backend: str | None = None,
     ):
         """Main 1D prior constructor.
 
@@ -173,11 +445,13 @@ class Prior(AbstractPrior):
             forward_transform (callable, optional): Transform from physical to sampling space. (default: ``None``)
             inverse_transform (callable, optional): Transform from sampling to physical space. (default: ``None``)
             log_jacobian (callable, optional): Log Jacobian of the physical to sampling transform. (default: ``None``)
-                
+            force_backend (str, optional): ``"cpu"``, a CUDA name or ``"jax"``; see
+                :class:`AbstractPrior`. (default: ``None``)
+
         Raises:
             ValueError: If ``check_range_nonzero`` is True and maximum <= minimum, or boundary is invalid.
         """
-        super().__init__(use_cupy=use_cupy, return_gpu=return_gpu)
+        super().__init__(use_cupy=use_cupy, return_gpu=return_gpu, force_backend=force_backend)
 
         if check_range_nonzero and maximum <= minimum:
             raise ValueError(
@@ -348,24 +622,26 @@ class Prior(AbstractPrior):
         Raises:
             ValueError: If minimum or maximum is infinite.
         """
-        if self.xp.any(self.xp.isinf([self.minimum, self.maximum])):
+        # * math.isinf on the bounds: jax.numpy and CuPy functions reject a Python list.
+        if math.isinf(self.minimum) or math.isinf(self.maximum):
             raise ValueError(
                 "Unable to use the generic CDF calculation for priors with "
                 "infinite support."
             )
-        
+
         x_arr = self.xp.asarray(x)
         grid, dx = self.xp.linspace(self.minimum, self.maximum, n_points, retstep=True)
 
-        pdf_grid = self.pdf(grid, **kwargs) 
-        cdf_grid = self.xp.zeros_like(pdf_grid)
-        # Numerical integration using the trapezoidal rule
-        cdf_grid[1:] = 0.5 * dx * self.xp.cumsum(pdf_grid[:-1] + pdf_grid[1:])
-        
-        if cdf_grid[-1] > 0:
-            cdf_grid /= cdf_grid[-1]
-        
-        output = self.xp.interp(x_arr, grid, cdf_grid, left=0.0, right=1.0)        
+        pdf_grid = self.pdf(grid, **kwargs)
+        # * Trapezoidal rule, assembled without in-place writes so that it also runs in JAX.
+        steps = 0.5 * dx * self.xp.cumsum(pdf_grid[:-1] + pdf_grid[1:])
+        cdf_grid = self.xp.concatenate([self.xp.zeros(1, dtype=steps.dtype), steps])
+        total = cdf_grid[-1]
+        cdf_grid = self.xp.where(
+            total > 0, cdf_grid / self.xp.where(total > 0, total, 1.0), cdf_grid
+        )
+
+        output = self.xp.interp(x_arr, grid, cdf_grid, left=0.0, right=1.0)
 
         if isinstance(x, (int, float)) and not self.return_gpu:
             output = float(output)
