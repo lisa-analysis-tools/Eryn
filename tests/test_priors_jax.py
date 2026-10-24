@@ -34,7 +34,7 @@ from eryn.priors import (  # noqa: E402
     UniformDistribution,
     UniformInVolume,
 )
-from tests.test_priors import ShiftedGaussian  # noqa: E402
+from tests.test_priors import ShiftedGaussian, SumAndDifference  # noqa: E402
 
 # * eryn never switches x64 itself; the tests run in float64 like the NumPy path.
 jax.config.update("jax_enable_x64", True)
@@ -192,18 +192,41 @@ def test_logpdf_gradients() -> None:
     assert isinstance(mvn.mu, jax.Array)
 
 
-def test_container_parity() -> None:
-    """The container's logpdf, also for keys subsets, matches NumPy under jit."""
+def test_container_joint_transforms_on_jax() -> None:
+    """A joint prior's *_nd transforms run on the jax backend too, also under jit."""
+    container = ProbDistContainer({("x", "y"): SumAndDifference(), "z": LogUniform(0.1, 10.0)})
+    container_jax = container.to_backend("jax")
+    physical = np.array([[1.0, 0.5, 2.0], [-0.3, 0.7, 0.5]])
+    sampling = container.forward_transform(physical)
+    assert_matches(jax.jit(container_jax.forward_transform)(physical), sampling)
+    assert_matches(jax.jit(container_jax.inverse_transform)(sampling), physical)
+    assert_matches(jax.jit(container_jax.log_jacobian)(physical), container.log_jacobian(physical))
+
+
+def test_container_parity_and_transforms() -> None:
+    """The container's logpdf, transforms, logpdf_physical and keys subsets match NumPy."""
     container = mixed_container()
     container_jax = container.to_backend("jax")
     np.random.seed(4)
     sampling = container.rvs(200)
+    physical = container.inverse_transform(sampling)
 
     assert_matches(jax.jit(container_jax.logpdf)(sampling), container.logpdf(sampling))
     # * keys holds positions: eryn compares them with each entry's indices.
     subset = [container.name_to_idx["a"], container.name_to_idx["e"]]
     assert_matches(
         container_jax.logpdf(sampling, keys=subset), container.logpdf(sampling, keys=subset)
+    )
+    assert_matches(jax.jit(container_jax.inverse_transform)(sampling), physical)
+    assert_matches(jax.jit(container_jax.forward_transform)(physical), sampling)
+    assert_matches(jax.jit(container_jax.log_jacobian)(physical), container.log_jacobian(physical))
+    assert_matches(container_jax.logpdf_physical(physical), container.logpdf_physical(physical))
+
+    # * Only the amplitude and latitude columns change between the two spaces.
+    unchanged = [container.name_to_idx[name] for name in ("a", "b", "c", "d", "e")]
+    np.testing.assert_array_equal(physical[:, unchanged], sampling[:, unchanged])
+    np.testing.assert_allclose(
+        physical[:, container.name_to_idx["amplitude"]], np.exp(sampling[:, 2])
     )
 
 
@@ -222,6 +245,12 @@ def test_container_under_vmap_grad_and_single_points() -> None:
     )
     gradient = jax.grad(container_jax.logpdf)(point)
     assert gradient.shape == point.shape and bool(jnp.all(jnp.isfinite(gradient)))
+
+    jacobian = jax.jacfwd(container_jax.inverse_transform)(point)
+    physical = container_jax.inverse_transform(point)
+    assert_matches(
+        jnp.log(jnp.abs(jnp.linalg.det(jacobian))), -container_jax.log_jacobian(physical)
+    )
 
 
 def test_draws_follow_their_keys() -> None:

@@ -14,6 +14,8 @@ from eryn.ensemble import EnsembleSampler
 from eryn.priors import (
     DeltaFunction,
     Exponential,
+    JointPrior,
+    LogUniform,
     Prior,
     ProbDistContainer,
     UniformDistribution,
@@ -491,6 +493,51 @@ def test_powerlaw_rejects_domains_without_a_monotone_map(alpha, minimum, maximum
     cannot cross 0."""
     with pytest.raises(ValueError):
         PowerLaw(alpha=alpha, minimum=minimum, maximum=maximum)
+
+
+class SumAndDifference(JointPrior):
+    """Standard normal prior on u = (x + y, x - y), a joint transform with |det| = 2."""
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            names=["x", "y"],
+            forward_transform_nd=self._forward_nd,
+            inverse_transform_nd=self._inverse_nd,
+            log_jacobian_nd=self._log_jacobian_nd,
+            **kwargs,
+        )
+
+    def _forward_nd(self, x_phys, **kwargs):
+        first, second = x_phys[..., 0], x_phys[..., 1]
+        return self.xp.stack([first + second, first - second], axis=-1)
+
+    def _inverse_nd(self, u_samp, **kwargs):
+        total, difference = u_samp[..., 0], u_samp[..., 1]
+        return self.xp.stack([(total + difference) / 2.0, (total - difference) / 2.0], axis=-1)
+
+    def _log_jacobian_nd(self, x_phys, **kwargs):
+        return self.xp.full(x_phys.shape[:-1], np.log(2.0))
+
+    def logpdf(self, x, **kwargs):
+        return -0.5 * self.xp.sum(self.xp.asarray(x) ** 2, axis=-1) - np.log(2.0 * np.pi)
+
+
+def test_container_transforms_with_a_joint_prior() -> None:
+    """A joint prior maps its block with its *_nd transforms; LogUniform maps its column."""
+    container = ProbDistContainer({("x", "y"): SumAndDifference(), "z": LogUniform(0.1, 10.0)})
+    physical = np.array([[1.0, 0.5, 2.0], [-0.3, 0.7, 0.5]])
+
+    sampling = container.forward_transform(physical)
+    expected = np.array([[1.5, 0.5, np.log(2.0)], [0.4, -1.0, np.log(0.5)]])
+    np.testing.assert_allclose(sampling, expected, rtol=1e-12)
+    np.testing.assert_allclose(container.inverse_transform(sampling), physical, rtol=1e-12)
+
+    # ln|det| adds the joint ln 2 and the LogUniform's ln|du/dz| = -ln z.
+    log_jacobian = container.log_jacobian(physical)
+    np.testing.assert_allclose(log_jacobian, np.log(2.0) - np.log(physical[:, 2]), rtol=1e-12)
+    np.testing.assert_allclose(
+        container.logpdf_physical(physical), container.logpdf(sampling) + log_jacobian, rtol=1e-12
+    )
 
 
 def test_exponential_with_negative_inputs() -> None:

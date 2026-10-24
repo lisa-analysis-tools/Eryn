@@ -32,7 +32,9 @@ class ProbDistContainer:
             every prior it holds, in place; :meth:`to_backend` returns a converted copy
             instead. (default: ``None``)
 
-    On the jax backend, :meth:`logpdf` and :meth:`rvs` (with ``rng_key``) run under
+    On the jax backend, :meth:`logpdf`, :meth:`rvs` (with ``rng_key``) and the
+    whole-vector transforms (:meth:`forward_transform`, :meth:`inverse_transform`,
+    :meth:`log_jacobian`, :meth:`logpdf_physical`, :meth:`rvs_physical`) run under
     ``jax.jit``, ``jax.vmap`` and ``jax.grad``.
 
     Attributes:
@@ -468,6 +470,148 @@ class ProbDistContainer:
 
         out = self.xp.stack([zeros if column is None else column for column in columns], axis=-1)
         return self._to_output(out)
+
+    def forward_transform(self, x_phys: NDArrayLike) -> NDArrayLike:
+        """Map physical points, shaped ``(..., ndim)``, to the sampling space.
+
+        Each prior maps its own columns with its ``forward_transform``, a
+        :class:`~eryn.priors.joint.JointPrior` with ``forward_transform_nd``, a nested
+        container recursively; parameters without a transform pass through. Conditional
+        variables are not passed, since the built-in transforms take none.
+
+        Args:
+            x_phys (array): Points in the physical space.
+
+        Returns:
+            array: The points in the sampling space, shaped like ``x_phys``.
+        """
+        return self._map_entries(x_phys, "forward_transform", "forward_transform_nd")
+
+    def inverse_transform(self, u_samp: NDArrayLike) -> NDArrayLike:
+        """Map sampling-space points, shaped ``(..., ndim)``, to the physical space.
+
+        The inverse of :meth:`forward_transform`, entry by entry.
+
+        Args:
+            u_samp (array): Points in the sampling space.
+
+        Returns:
+            array: The points in the physical space, shaped like ``u_samp``.
+        """
+        return self._map_entries(u_samp, "inverse_transform", "inverse_transform_nd")
+
+    def log_jacobian(self, x_phys: NDArrayLike) -> NDArrayLike:
+        """Return ln|det du/dx| of :meth:`forward_transform` at physical points ``(..., ndim)``.
+
+        The transforms act on separate parameters, so the log-determinant is the sum of the
+        priors' ``log_jacobian`` (``log_jacobian_nd`` for joint priors); parameters without a
+        transform add zero.
+
+        Args:
+            x_phys (array): Points in the physical space.
+
+        Returns:
+            array: The log-Jacobian, shaped ``x_phys.shape[:-1]``.
+        """
+        values = self.xp.asarray(x_phys)
+        total = self.xp.zeros(values.shape[:-1])
+        for inds, prior_i in self.priors:
+            if isinstance(prior_i, ProbDistContainer):
+                term = prior_i.log_jacobian(values[..., inds])
+            elif hasattr(prior_i, "log_jacobian_nd"):
+                if prior_i.log_jacobian_nd is None:
+                    continue
+                term = prior_i.log_jacobian_nd(values[..., inds])
+            else:
+                function = getattr(prior_i, "log_jacobian", None)
+                if function is None:
+                    continue
+                self._check_single_parameter(inds, prior_i)
+                term = function(values[..., inds[0]])
+            total = total + self.xp.asarray(term)
+        return self._to_output(total)
+
+    def logpdf_physical(self, x_phys: NDArrayLike, **kwargs: Any) -> NDArrayLike:
+        """Log prior density at physical points: :meth:`logpdf` of the sampling-space
+        points plus :meth:`log_jacobian`, as ``Prior.logpdf_physical`` does for one parameter.
+
+        Args:
+            x_phys (array): Points in the physical space, shaped ``(..., ndim)``.
+            **kwargs: Passed on to :meth:`logpdf`.
+
+        Returns:
+            array: The log density in the physical space.
+        """
+        return self.logpdf(self.forward_transform(x_phys), **kwargs) + self.log_jacobian(x_phys)
+
+    def rvs_physical(
+        self,
+        size: int | tuple[int, ...] = 1,
+        keys: Sequence[str | int] | None = None,
+        rng_key: jax.Array | None = None,
+        **kwargs: Any,
+    ) -> NDArrayLike:
+        """Draw from the prior and map the draws to the physical space.
+
+        Args:
+            size (int or tuple of ints, optional): As for :meth:`rvs`.
+            keys (list, optional): As for :meth:`rvs`.
+            rng_key (jax.Array, optional): As for :meth:`rvs`.
+            **kwargs: Passed on to :meth:`rvs`.
+
+        Returns:
+            array: Draws in the physical space, shaped ``size + (ndim,)``.
+        """
+        # TODO: decide whether keys stays: skipped parameters are zeros that inverse_transform
+        # TODO: then maps (a LogUniform to 1, a CosineUniform to pi/2), so they look like draws.
+        draws = self.rvs(size=size, keys=keys, rng_key=rng_key, **kwargs)
+        return self.inverse_transform(draws)
+
+    def _map_entries(
+        self, points: NDArrayLike, method_name: str, joint_method_name: str
+    ) -> NDArrayLike:
+        """Apply each prior's transform to its own columns of the parameter vector.
+
+        Serves :meth:`forward_transform` and :meth:`inverse_transform`: ``method_name`` names
+        the one-parameter transform of a :class:`~eryn.priors.base.Prior`, and
+        ``joint_method_name`` the matching ``*_nd`` transform of a joint prior.
+        """
+        values = self.xp.asarray(points)
+        # * Parameters without a transform pass through unchanged.
+        columns = [values[..., position] for position in range(self.ndim)]
+        for inds, prior_i in self.priors:
+            if isinstance(prior_i, ProbDistContainer):
+                # * Nested container: maps its block recursively.
+                mapped = getattr(prior_i, method_name)(values[..., inds])
+            elif hasattr(prior_i, joint_method_name):
+                # * Joint prior: maps its whole block with its *_nd transform.
+                function = getattr(prior_i, joint_method_name)
+                if function is None:
+                    continue
+                mapped = function(values[..., inds])
+            else:
+                # * One-parameter prior: maps its column, kept as a block of width one.
+                function = getattr(prior_i, method_name, None)
+                if function is None:
+                    continue
+                self._check_single_parameter(inds, prior_i)
+                mapped = self.xp.asarray(function(values[..., inds[0]]))[..., None]
+            # * Scatter the block back to the positions of its parameters.
+            mapped = self.xp.asarray(mapped)
+            for column_index, position in enumerate(inds):
+                columns[position] = mapped[..., column_index]
+        # * One stack instead of in-place writes, so the same code runs in JAX.
+        return self._to_output(self.xp.stack(columns, axis=-1))
+
+    @staticmethod
+    def _check_single_parameter(inds: NDArray, prior_i: Any) -> None:
+        """Raise when a one-parameter transform sits under a key of several parameters."""
+        if len(inds) > 1:
+            raise NotImplementedError(
+                f"{type(prior_i).__name__} at indices {tuple(int(v) for v in inds)} has a "
+                "one-parameter transform but spans several parameters; use a JointPrior "
+                "with forward_transform_nd for a joint transform."
+            )
 
     def reset_key_order(self, new_key_order: list[int] | list[str]) -> None:
         """Resets the key order to a new key order and reshuffles the prior to match the new key order.
