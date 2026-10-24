@@ -1,7 +1,7 @@
 """Tests of the jax backend of eryn's priors and prior containers.
 
 The jax results must equal the NumPy ones to 1e-12, run under ``jax.jit``, ``jax.vmap`` and
-``jax.grad``, and draw reproducibly from explicit keys.
+``jax.grad``, draw reproducibly from explicit keys, and survive deepcopy and pickle.
 """
 
 from __future__ import annotations
@@ -34,7 +34,13 @@ from eryn.priors import (  # noqa: E402
     UniformDistribution,
     UniformInVolume,
 )
-from tests.test_priors import ShiftedGaussian, SumAndDifference  # noqa: E402
+from tests.test_priors import (  # noqa: E402
+    CONTAINER_BUILDERS,
+    PRIOR_BUILDERS,
+    ShiftedGaussian,
+    SumAndDifference,
+    assert_round_trips,
+)
 
 # * eryn never switches x64 itself; the tests run in float64 like the NumPy path.
 jax.config.update("jax_enable_x64", True)
@@ -339,13 +345,34 @@ def test_discrete_and_multivariate_draws() -> None:
     assert stats.kstest(distances, stats.chi2(2).cdf).pvalue > 1e-3
 
 
+@pytest.mark.parametrize("name", sorted(PRIOR_BUILDERS))
+def test_jax_priors_survive_deepcopy_and_pickle(name) -> None:
+    """jax priors hold the library name, not the module, so deepcopy and pickle work."""
+    assert_round_trips(PRIOR_BUILDERS[name]().to_backend("jax"), rng_key=KEY)
+
+
+@pytest.mark.parametrize("name", sorted(CONTAINER_BUILDERS))
+def test_jax_containers_survive_deepcopy_and_pickle(name) -> None:
+    """Mixed, joint and nested jax containers survive deepcopy and pickle."""
+    assert_round_trips(CONTAINER_BUILDERS[name]().to_backend("jax"), rng_key=KEY)
+
+
 def test_to_backend_round_trip_and_in_place_container() -> None:
     """to_backend copies; a container built with force_backend switches its priors in place."""
     prior = LogUniform(0.1, 10.0)
-    round_trip = prior.to_backend("jax").to_backend("cpu")
+    converted = prior.to_backend("jax")
+    # * The copy's stored transforms must run on the copy, so on jax, not on the original.
+    assert converted.forward_transform.__self__ is converted
+    round_trip = converted.to_backend("cpu")
     assert prior.backend_name == "numpy" and round_trip.backend_name == "numpy"
     points = np.linspace(-3.0, 3.0, 13)
     np.testing.assert_array_equal(round_trip.logpdf(points), prior.logpdf(points))
+
+    container = CONTAINER_BUILDERS["nested"]()
+    container_jax = container.to_backend("jax")
+    for _, child in container_jax.priors:
+        assert child.backend_name == "jax"
+    assert all(child.backend_name == "numpy" for _, child in container.priors)
 
     shared = UniformDistribution(0.0, 1.0)
     ProbDistContainer({"a": shared}, force_backend="jax")

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import inspect
+import pickle
 import subprocess
 import sys
 import warnings
@@ -10,13 +13,21 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.stats import kstest, poisson, multivariate_normal
 
+from eryn import priors as eryn_priors
 from eryn.ensemble import EnsembleSampler
 from eryn.priors import (
+    CategoricalDistribution,
     DeltaFunction,
     Exponential,
+    Gaussian,
+    InverseUniform,
     JointPrior,
+    LogGaussian,
+    LogNormal,
     LogUniform,
+    Normal,
     Prior,
+    UniformInVolume,
     ProbDistContainer,
     UniformDistribution,
     SineUniform,
@@ -521,6 +532,11 @@ class SumAndDifference(JointPrior):
     def logpdf(self, x, **kwargs):
         return -0.5 * self.xp.sum(self.xp.asarray(x) ** 2, axis=-1) - np.log(2.0 * np.pi)
 
+    def rvs(self, size=(1,), rng_key: jax.Array | None = None, **kwargs):
+        if isinstance(size, int):
+            size = (size,)
+        return self._to_device(self._random_normal(0.0, 1.0, (*size, 2), rng_key))
+
 
 def test_container_transforms_with_a_joint_prior() -> None:
     """A joint prior maps its block with its *_nd transforms; LogUniform maps its column."""
@@ -580,3 +596,122 @@ class ShiftedGaussian(Prior):
 
     def logpdf(self, x, a=0.0, **kwargs):
         return self._to_device(-0.5 * (self.xp.asarray(x) - a) ** 2 - 0.5 * np.log(2.0 * np.pi))
+
+
+# * One builder per exported prior class; test_priors_jax.py reruns them on the jax backend.
+PRIOR_BUILDERS = {
+    "UniformDistribution": lambda: UniformDistribution(2.0, 5.0),
+    "DeltaFunction": lambda: DeltaFunction(2.0),
+    "PowerLaw": lambda: PowerLaw(alpha=2.0, minimum=-2.0, maximum=3.0),
+    "LogUniform": lambda: LogUniform(0.1, 10.0),
+    "CosineUniform": lambda: CosineUniform(),
+    "SineUniform": lambda: SineUniform(),
+    "Log10Uniform": lambda: Log10Uniform(1e-24, 1e-20),
+    "UniformInVolume": lambda: UniformInVolume(0.5, 3.0),
+    "InverseUniform": lambda: InverseUniform(1.0, 10.0),
+    "Gaussian": lambda: Gaussian(1.0, 2.0),
+    "Normal": lambda: Normal(1.0, 2.0),
+    "LogNormal": lambda: LogNormal(0.5, 0.3),
+    "LogGaussian": lambda: LogGaussian(0.5, 0.3),
+    "Exponential": lambda: Exponential(2.0),
+    "DiscreteUniform": lambda: DiscreteUniform(1, 5),
+    "CategoricalDistribution": lambda: CategoricalDistribution(4),
+    "PoissonDistribution": lambda: PoissonDistribution(3.0),
+    "MultivariateGaussian": lambda: MultivariateGaussian(
+        ["c", "d"], mu=[0.0, 1.0], cov=[[1.0, 0.2], [0.2, 0.5]]
+    ),
+    "SumAndDifference": SumAndDifference,
+}
+
+CONTAINER_BUILDERS = {
+    "mixed": lambda: ProbDistContainer(
+        {
+            "a": UniformDistribution(0.0, 10.0),
+            "b": ShiftedGaussian(),
+            "amplitude": LogUniform(0.1, 10.0),
+            ("c", "d"): MultivariateGaussian(
+                ["c", "d"], mu=[0.0, 1.0], cov=[[1.0, 0.2], [0.2, 0.5]]
+            ),
+        }
+    ),
+    "joint": lambda: ProbDistContainer(
+        {("x", "y"): SumAndDifference(), "z": LogUniform(0.1, 10.0)}
+    ),
+    "nested": lambda: ProbDistContainer(
+        {
+            "a": UniformDistribution(0.0, 1.0),
+            ("b", "c"): ProbDistContainer({"b": LogUniform(0.1, 10.0), "c": SineUniform()}),
+        }
+    ),
+}
+
+
+def _priors_in(obj):
+    """The prior itself, or every prior a container holds, nested containers included."""
+    if isinstance(obj, ProbDistContainer):
+        for _, child in obj.priors:
+            yield from _priors_in(child)
+    else:
+        yield obj
+
+
+def _round_trip_outputs(obj, rng_key=None):
+    """Draws, densities and transforms at the draws, which a copy must reproduce exactly."""
+    if obj.backend_name == "jax":
+        draws = obj.rvs(4, rng_key=rng_key)
+    else:
+        np.random.seed(17)
+        draws = obj.rvs(4)
+    outputs = {"rvs": draws, "logpdf": obj.logpdf(draws)}
+    if getattr(obj, "inverse_transform", None) is not None:
+        physical = obj.inverse_transform(draws)
+        outputs["inverse_transform"] = physical
+        outputs["forward_transform"] = obj.forward_transform(physical)
+        outputs["log_jacobian"] = obj.log_jacobian(physical)
+    return {name: np.asarray(value) for name, value in outputs.items()}
+
+
+def assert_round_trips(obj, rng_key=None) -> None:
+    """deepcopy, pickle and pickle of a deepcopy give an equal object on the same backend.
+
+    The copy reproduces the draws, densities and transforms exactly, and every transform a
+    prior stores as a bound method is bound to the copy, not to the original.
+    """
+    expected = _round_trip_outputs(obj, rng_key)
+    for route, restored in (
+        ("deepcopy", copy.deepcopy(obj)),
+        ("pickle", pickle.loads(pickle.dumps(obj))),
+        ("pickle of deepcopy", pickle.loads(pickle.dumps(copy.deepcopy(obj)))),
+    ):
+        assert type(restored) is type(obj), route
+        assert restored.backend_name == obj.backend_name, route
+        for prior in _priors_in(restored):
+            for name, value in vars(prior).items():
+                if inspect.ismethod(value):
+                    assert value.__self__ is prior, f"{route}: {name} is bound to another object"
+        produced = _round_trip_outputs(restored, rng_key)
+        for name, value in expected.items():
+            np.testing.assert_array_equal(produced[name], value, err_msg=f"{route}: {name}")
+
+
+def test_round_trips_cover_every_exported_prior() -> None:
+    """A new prior class exported from eryn.priors needs a builder above."""
+    exported = {
+        name
+        for name in eryn_priors.__all__
+        if inspect.isclass(getattr(eryn_priors, name))
+        and issubclass(getattr(eryn_priors, name), (Prior, JointPrior))
+    }
+    assert exported - {"Prior", "JointPrior"} <= set(PRIOR_BUILDERS)
+
+
+@pytest.mark.parametrize("name", sorted(PRIOR_BUILDERS))
+def test_priors_survive_deepcopy_and_pickle(name) -> None:
+    """Every prior class survives deepcopy and pickle on the NumPy backend."""
+    assert_round_trips(PRIOR_BUILDERS[name]())
+
+
+@pytest.mark.parametrize("name", sorted(CONTAINER_BUILDERS))
+def test_containers_survive_deepcopy_and_pickle(name) -> None:
+    """Mixed, joint and nested containers survive deepcopy and pickle on the NumPy backend."""
+    assert_round_trips(CONTAINER_BUILDERS[name]())
