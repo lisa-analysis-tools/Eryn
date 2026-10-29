@@ -72,6 +72,29 @@ Implemented Group Moves
     :show-inheritance:
     :inherited-members:
 
+Leaf Pool Moves
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Leaf Pool Parent Class
+^^^^^^^^^^^^^^^^^^^^^^^
+.. autoclass:: eryn.moves.LeafPoolMove
+    :members:
+    :show-inheritance:
+    :inherited-members:
+
+Implemented Leaf Pool Moves
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. autoclass:: eryn.moves.LeafPoolAMMove
+    :members:
+    :show-inheritance:
+    :inherited-members:
+
+.. autoclass:: eryn.moves.LeafPoolStretchMove
+    :members:
+    :show-inheritance:
+    :inherited-members:
+
 
 Reversible Jump Moves
 ~~~~~~~~~~~~~~~~~~~~~~~
