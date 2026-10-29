@@ -21,6 +21,12 @@ class GroupStretchMove(GroupMove, StretchMove):
 
     This move allows for "stretch"-like proposal to be used in Reversible Jump MCMC.
 
+    The stretch factor :math:`z^{N-1}` is the full acceptance factor only if the friend
+    of each leaf is chosen independently of the current position of that leaf. See
+    :class:`GroupMove` for how the friends should be set up, how often updating them
+    (``n_iter_update``) can bias the posterior, and ``freeze_after``, which makes the
+    move exact after burn-in.
+
     Args:
         **kwargs (dict, optional): Keyword arguments passed to :class:`GroupMove` and
             :class:`StretchMove`.

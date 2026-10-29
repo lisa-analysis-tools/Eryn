@@ -21,12 +21,35 @@ class GroupMove(Move, ABC):
     that is updated every `n_iter_update` iterations. This update is performed with the
     last set of coordinates to maintain detailed balance.
 
+    The acceptance of a group proposal assumes that the friend of a leaf is chosen
+    with the same probability from the current and from the proposed position, so
+    the friend choice must not depend on the current position of that leaf. Friends
+    recomputed from the current coordinates at every iteration (for example the
+    nearest points to each leaf, found in :meth:`setup`) break this assumption, and
+    the posterior comes out biased, usually too wide. Friends kept per leaf and
+    refreshed only in :meth:`setup_friends` are exact between refreshes, but each
+    refresh adapts the friends to the current state, so the sampler is adaptive. 
+    The bias is small when the friends of a leaf cover most of the posterior samples 
+    of the same source (for example ``nfriends`` equal to the number of walkers, with 
+    one copy of the source per walker), and grows as the friends become more local. 
+    Setting ``freeze_after`` removes it after burn-in.
+
     Args:
         nfriends (int, optional): The number of friends to draw from as the complimentary
             ensemble. This group is determined from the stationary group. If ``None``, it will
             be set to the number of walkers. (default: ``None``)
         n_iter_update (int, optional): Number of iterations to run before updating the
-            stationary distribution. (default: 100).
+            stationary distribution. (default: 100). Each update adapts the friends to the
+            current state, so the move is not exact while updates continue. Frequent updates
+            with friend lists that cover a small part of the posterior can bias the posterior
+            (usually too wide). A longer period reduces this bias but does not remove it;
+            see ``freeze_after``.
+        freeze_after (int, optional): If given, the friends are no longer updated after this
+            iteration (counted over all calls to the move, including burn-in), and the move
+            is exact from then on for a fixed number of leaves. Choose it at or before the end
+            of burn-in, so that the friends have adapted to the posterior before they are fixed.
+            With reversible jump, :meth:`fix_friends` still assigns friends to new leaves.
+            If ``None``, the friends are updated for the whole run. (default: ``None``)
         live_dangerously (bool, optional): If ``True``, allow for ``n_iter_update == 1``.
             (deafault: ``False``)
 
@@ -35,17 +58,32 @@ class GroupMove(Move, ABC):
     """
 
     def __init__(
-        self, nfriends=None, n_iter_update=100, live_dangerously=False, **kwargs
+        self,
+        nfriends=None,
+        n_iter_update=100,
+        freeze_after=None,
+        live_dangerously=False,
+        **kwargs
     ):
 
         Move.__init__(self, **kwargs)
         self.nfriends = None if nfriends is None else int(nfriends)
         self.n_iter_update = n_iter_update
+        self.freeze_after = None if freeze_after is None else int(freeze_after)
 
         if self.n_iter_update <= 1 and not live_dangerously:
             raise ValueError("n_iter_update must be greather than or equal to 2.")
 
         self.iter = 0
+
+    @property
+    def update_friends_now(self):
+        """``True`` if the friends are updated at the current iteration."""
+        if self.iter == 0:
+            return True
+        if self.freeze_after is not None and self.iter > self.freeze_after:
+            return False
+        return self.iter % self.n_iter_update == 0
 
     def find_friends(self, name, s, s_inds=None, branch_supps=None):
         """Function for finding friends.
@@ -145,15 +183,17 @@ class GroupMove(Move, ABC):
         # Run any move-specific setup.
         self.setup(state.branches)
 
-        if self.iter == 0 or self.iter % self.n_iter_update == 0:
+        update_friends = self.update_friends_now
+
+        if update_friends:
             self.setup_friends(state.branches)
 
-        if self.iter != 0 and self.iter % self.n_iter_update == 0:
+        if self.iter != 0 and update_friends:
             # store old values to maintain detailed balance when updating
             old_branches = deepcopy(state.branches)
 
         # fix any friends that may have come through rj
-        if self.iter != 0 and self.iter % self.n_iter_update != 0:
+        if not update_friends:
             self.fix_friends(state.branches)
 
         # Split the ensemble in half and iterate over these two halves.
@@ -272,9 +312,8 @@ class GroupMove(Move, ABC):
         if self.temperature_control is not None:
             state = self.temperature_control.temper_comps(state)
 
-        if self.iter != 0 and self.iter % self.n_iter_update == 0:
-            # use old values to maintain detailed balance when updating
-            # nfriends
+        if self.iter != 0 and update_friends:
+            # use old values to maintain detailed balance when updating nfriends
             self.setup_friends(old_branches)
 
         self.iter += 1
