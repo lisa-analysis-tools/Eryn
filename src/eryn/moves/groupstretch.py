@@ -26,6 +26,12 @@ class GroupStretchMove(GroupMove, StretchMove):
     :meth:`~eryn.moves.GroupMove.setup_friends` and
     :meth:`~eryn.moves.GroupMove.find_friends`.
 
+    The stretch factor :math:`z^{N-1}` is the full acceptance factor only if the friend
+    of each leaf is chosen independently of the current position of that leaf. See
+    :class:`GroupMove` for how the friends should be set up, how often updating them
+    (``n_iter_update``) can bias the posterior, and ``freeze_after``, which makes the
+    move exact after burn-in.
+
     Args:
         **kwargs: Passed whole to BOTH the :class:`~eryn.moves.GroupMove` constructor
             (``nfriends``, ``n_iter_update``, ``live_dangerously``) and the

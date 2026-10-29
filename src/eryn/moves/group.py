@@ -33,27 +33,48 @@ class GroupMove(Move, ABC):
     branches), :meth:`find_friends` (return a complement point per proposed walker) and
     ``get_proposal``; :meth:`fix_friends` is an optional hook for leaves born through RJ.
 
+    The acceptance of a group proposal assumes that the friend of a leaf is chosen
+    with the same probability from the current and from the proposed position, so
+    the friend choice must not depend on the current position of that leaf. Friends
+    recomputed from the current coordinates at every iteration (for example the
+    nearest points to each leaf, found in :meth:`setup`) break this assumption, and
+    the posterior comes out biased, usually too wide. Friends kept per leaf and
+    refreshed only in :meth:`setup_friends` are exact between refreshes, but each
+    refresh adapts the friends to the current state, so the sampler is adaptive.
+    The bias is small when the friends of a leaf cover most of the posterior samples
+    of the same source (for example ``nfriends`` equal to the number of walkers, with
+    one copy of the source per walker), and grows as the friends become more local.
+    Setting ``freeze_after`` removes it after burn-in.
+
     Unlike :class:`~eryn.moves.RedBlueMove`, :meth:`propose` moves ALL walkers at once
     (no sub-ensemble split).
 
     Args:
-        nfriends (int): Number of friends a proposal draws from in the stationary group.
-            The code calls ``int(nfriends)`` at construction, so the ``None`` default
-            raises ``TypeError``; pass an integer (``propose`` would otherwise fall back to
-            ``nwalkers``).
+        nfriends (int, optional): Number of friends a proposal draws from in the stationary
+            group. If ``None``, it is set to the number of walkers at the first call to
+            :meth:`propose`. Default ``None``.
         n_iter_update (int, optional): Calls between stationary-group rebuilds. Default
-            ``100``.
+            ``100``. Each rebuild adapts the friends to the current state, so the move is
+            not exact while rebuilds continue. Frequent rebuilds with friend lists that cover
+            a small part of the posterior can bias the posterior (usually too wide). A longer
+            period reduces this bias but does not remove it; see ``freeze_after``.
+        freeze_after (int, optional): If given, the friends are no longer rebuilt after this
+            call (counted over all calls to :meth:`propose`, including burn-in), and the move
+            is exact from then on for a fixed number of leaves. Choose it at or before the end
+            of burn-in, so that the friends have adapted to the posterior before they are fixed.
+            With reversible jump, :meth:`fix_friends` still assigns friends to new leaves.
+            If ``None``, the friends are rebuilt for the whole run. Default ``None``.
         live_dangerously (bool, optional): If ``True``, allow ``n_iter_update <= 1``.
             Default ``False``.
         **kwargs: Forwarded to :class:`~eryn.moves.Move`.
 
     Raises:
         ValueError: ``n_iter_update <= 1`` without ``live_dangerously``.
-        TypeError: ``nfriends`` left at ``None``.
 
     Attributes:
         nfriends (int): See ``nfriends``.
         n_iter_update (int): See ``n_iter_update``.
+        freeze_after (int or None): See ``freeze_after``.
         iter (int): Number of :meth:`propose` calls so far.
         current_model (:class:`eryn.model.Model`): Model of the current call (set before
             ``get_proposal``, for subclasses).
@@ -66,17 +87,32 @@ class GroupMove(Move, ABC):
     """
 
     def __init__(
-        self, nfriends=None, n_iter_update=100, live_dangerously=False, **kwargs
+        self,
+        nfriends=None,
+        n_iter_update=100,
+        freeze_after=None,
+        live_dangerously=False,
+        **kwargs
     ):
 
         Move.__init__(self, **kwargs)
         self.nfriends = None if nfriends is None else int(nfriends)
         self.n_iter_update = n_iter_update
+        self.freeze_after = None if freeze_after is None else int(freeze_after)
 
         if self.n_iter_update <= 1 and not live_dangerously:
             raise ValueError("n_iter_update must be greather than or equal to 2.")
 
         self.iter = 0
+
+    @property
+    def update_friends_now(self):
+        """``True`` if the friends are updated at the current iteration."""
+        if self.iter == 0:
+            return True
+        if self.freeze_after is not None and self.iter > self.freeze_after:
+            return False
+        return self.iter % self.n_iter_update == 0
 
     def find_friends(self, name, s, s_inds=None, branch_supps=None):
         """Return the complement point for every proposed walker (implemented by subclasses).
@@ -215,15 +251,17 @@ class GroupMove(Move, ABC):
         # Run any move-specific setup.
         self.setup(state.branches)
 
-        if self.iter == 0 or self.iter % self.n_iter_update == 0:
+        update_friends = self.update_friends_now
+
+        if update_friends:
             self.setup_friends(state.branches)
 
-        if self.iter != 0 and self.iter % self.n_iter_update == 0:
+        if self.iter != 0 and update_friends:
             # store old values to maintain detailed balance when updating
             old_branches = deepcopy(state.branches)
 
         # fix any friends that may have come through rj
-        if self.iter != 0 and self.iter % self.n_iter_update != 0:
+        if not update_friends:
             self.fix_friends(state.branches)
 
         # Split the ensemble in half and iterate over these two halves.
@@ -342,9 +380,8 @@ class GroupMove(Move, ABC):
         if self.temperature_control is not None:
             state = self.temperature_control.temper_comps(state)
 
-        if self.iter != 0 and self.iter % self.n_iter_update == 0:
-            # use old values to maintain detailed balance when updating
-            # nfriends
+        if self.iter != 0 and update_friends:
+            # use old values to maintain detailed balance when updating nfriends
             self.setup_friends(old_branches)
 
         self.iter += 1
