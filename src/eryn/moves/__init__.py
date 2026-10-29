@@ -22,6 +22,7 @@ from .group import GroupMove
 from .groupstretch import GroupStretchMove
 from .groupde import GroupDEMove, GroupDESnookerMove
 from .combine import CombineMove
+from .leafpool import LeafPoolMove, LeafPoolAMMove, LeafPoolStretchMove
 
 # from .basicmodelswaprj import BasicSymmetricModelSwapRJMove
 from .mtdistgen import MTDistGenMove
@@ -47,4 +48,7 @@ __all__ = [
     "GroupDEMove",
     "GroupDESnookerMove",
     "CombineMove",
+    "LeafPoolMove",
+    "LeafPoolAMMove",
+    "LeafPoolStretchMove",
 ]
