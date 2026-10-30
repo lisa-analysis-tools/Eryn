@@ -80,7 +80,7 @@ def test_rejects_bad_setups():
 
 def test_factor_is_flow_only_and_columns_split():
     flow = _make_flow()
-    move = FlowGaussianMove(flow, "x", MASK, cov=np.diag([0.1, 0.2]))
+    move = FlowGaussianMove(flow, "x", MASK, cov=np.diag([0.1, 0.2]), flow_prob=None)
     coords = _coords()
     q, factors = move.get_proposal({"x": coords}, np.random.RandomState(0))
 
@@ -88,6 +88,45 @@ def test_factor_is_flow_only_and_columns_split():
     assert np.all(new[:, ~MASK] != old[:, ~MASK]) and np.all(new[:, MASK] != old[:, MASK])
     expected = flow.log_prob(old[:, MASK], context=0) - flow.log_prob(new[:, MASK], context=0)
     np.testing.assert_allclose(factors, expected.reshape(factors.shape), atol=1e-5)
+
+
+def test_random_choice_moves_one_half_per_row():
+    """flow_prob: each row moves either its flow or its Gaussian columns; only flow rows get a factor."""
+    flow = _make_flow()
+    move = FlowGaussianMove(flow, "x", MASK, cov=0.1, flow_prob=0.3)
+    coords = _coords(ntemps=4, nwalkers=50)
+    q, factors = move.get_proposal({"x": coords}, np.random.RandomState(0))
+
+    old, new = coords.reshape(-1, 4), q["x"].reshape(-1, 4)
+    flow_moved = np.all(new[:, MASK] != old[:, MASK], axis=1)
+    gauss_moved = np.all(new[:, ~MASK] != old[:, ~MASK], axis=1)
+    np.testing.assert_array_equal(flow_moved, ~gauss_moved)  # exactly one half per row
+    np.testing.assert_array_equal(new[np.ix_(flow_moved, ~MASK)], old[np.ix_(flow_moved, ~MASK)])
+    np.testing.assert_array_equal(new[np.ix_(gauss_moved, MASK)], old[np.ix_(gauss_moved, MASK)])
+    assert 0.15 < flow_moved.mean() < 0.45  # 200 rows at p = 0.3
+
+    expected = np.zeros(len(old))
+    expected[flow_moved] = flow.log_prob(old[flow_moved][:, MASK], context=0) - flow.log_prob(
+        new[flow_moved][:, MASK], context=0
+    )
+    np.testing.assert_allclose(factors, expected.reshape(factors.shape), atol=1e-5)
+
+    with pytest.raises(ValueError, match="flow_prob"):
+        FlowGaussianMove(flow, "x", MASK, cov=0.1, flow_prob=1.0)
+
+
+def test_random_choice_falls_back_to_the_half_that_can_propose():
+    coords = _coords()
+    # unfitted flow: every row takes the Gaussian step
+    move = FlowGaussianMove(_make_flow(fit=False), "x", MASK, cov=0.1, flow_prob=0.5)
+    q, factors = move.get_proposal({"x": coords}, np.random.RandomState(0))
+    assert np.all(q["x"][..., ~MASK] != coords[..., ~MASK]) and np.all(factors == 0.0)
+    np.testing.assert_array_equal(q["x"][..., MASK], coords[..., MASK])
+    # no covariance yet: every row takes the flow draw
+    move = FlowGaussianMove(_make_flow(), "x", MASK, adapt_cov=True, flow_prob=0.5)
+    q, _ = move.get_proposal({"x": coords}, np.random.RandomState(0))
+    assert np.all(q["x"][..., MASK] != coords[..., MASK])
+    np.testing.assert_array_equal(q["x"][..., ~MASK], coords[..., ~MASK])
 
 
 def test_gaussian_columns_match_gaussian_move_logic():
@@ -128,7 +167,7 @@ def test_no_cov_yet_moves_flow_columns_only():
 
 def test_inactive_leaves_and_other_branches_untouched():
     flow = _make_flow()
-    move = FlowGaussianMove(flow, "x", MASK, cov=0.1)
+    move = FlowGaussianMove(flow, "x", MASK, cov=0.1, flow_prob=None)
     coords = _coords(nleaves=2)
     inds = np.ones(coords.shape[:-1], dtype=bool)
     inds[:, :, 1] = False
@@ -147,7 +186,7 @@ def test_inactive_leaves_and_other_branches_untouched():
 
 def test_active_betas_scale_flow_columns():
     flow = _make_flow()
-    move = FlowGaussianMove(flow, "x", MASK, cov=0.1)
+    move = FlowGaussianMove(flow, "x", MASK, cov=0.1, flow_prob=None)
     move.active_betas = np.array([1.0, 0.25])
     coords = _coords()
     q, factors = move.get_proposal({"x": coords}, np.random.RandomState(0))
@@ -201,7 +240,7 @@ def test_cov_shape_checked():
 
 def test_periodic_wraps_gaussian_columns_only():
     flow = _make_flow()
-    move = FlowGaussianMove(flow, "x", MASK, cov=0.1)
+    move = FlowGaussianMove(flow, "x", MASK, cov=0.1, flow_prob=None)
     move.periodic = PeriodicContainer({"x": {0: 0.5, 1: 0.5}})
     coords = _coords() + 10.0  # far outside [0, 0.5)
     q, factors = move.get_proposal({"x": coords}, np.random.RandomState(0))
@@ -213,7 +252,8 @@ def test_periodic_wraps_gaussian_columns_only():
     np.testing.assert_allclose(factors, expected.reshape(factors.shape), atol=1e-5)
 
 
-def test_sampler_recovers_correlated_target():
+@pytest.mark.parametrize("flow_prob", [None, 0.5])
+def test_sampler_recovers_correlated_target(flow_prob):
     """End-to-end detailed balance: only this move, a 3-D correlated Gaussian target.
 
     The flow is deliberately a poor match to the target marginal of its columns (shifted,
@@ -234,7 +274,7 @@ def test_sampler_recovers_correlated_target():
 
     mask = np.array([True, True, False])  # flow on 0, 1; Gaussian on 2
     flow = _make_flow(seed=3, mean=(0.0, 0.2), scale=1.6)
-    move = FlowGaussianMove(flow, "x", mask, cov=0.5)
+    move = FlowGaussianMove(flow, "x", mask, cov=0.5, flow_prob=flow_prob)
 
     nwalkers, nsteps, burn = 32, 1500, 200
     priors = {"x": ProbDistContainer({i: uniform_dist(-15.0, 15.0) for i in range(3)})}
