@@ -193,8 +193,9 @@ class FlowGaussianMove(ConditionalFlowMove):
                 if len(rows) < self.adapt_min_samples:
                     continue
                 cov = np.atleast_2d(np.cov(rows[:, ~self.flow_params], rowvar=False))
-                # a tiny relative jitter keeps the decomposition well posed for collapsed walkers
-                cov += np.eye(self.nB) * (1e-12 * np.max(np.abs(np.diag(cov))) + 1e-300)
+                # a tiny per-column relative jitter: well posed for collapsed walkers, scale-free
+                # across columns of very different size
+                cov += np.diag(1e-12 * np.diag(cov))
                 adapted[leaf] = cov
             if adapted:
                 self.update_covariance(adapted)

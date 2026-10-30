@@ -48,7 +48,9 @@ The subpackage is organised around a small set of seams:
   sampler process, while :class:`~eryn.flows.ProcessExecutor` trains a clone of
   the flow in a spawned worker process so sampling is never blocked.
 - **Moves.**  The proposals themselves live in ``eryn.moves``:
-  :class:`~eryn.moves.ConditionalFlowMove` (online or offline flow proposal) and
+  :class:`~eryn.moves.ConditionalFlowMove` (online or offline flow proposal),
+  :class:`~eryn.moves.FlowGaussianMove` (a flow on a subset of the parameters
+  and a Gaussian random walk on the rest, in one proposal) and
   :class:`~eryn.moves.IndependentProposalMove` (a generic independence proposal
   used as a baseline, e.g. with a GMM).
 
@@ -195,6 +197,10 @@ Flow Moves
     :members:
     :show-inheritance:
     :inherited-members:
+
+.. autoclass:: eryn.moves.FlowGaussianMove
+    :members:
+    :show-inheritance:
 
 .. autoclass:: eryn.moves.FlowNUTSMove
     :members:
