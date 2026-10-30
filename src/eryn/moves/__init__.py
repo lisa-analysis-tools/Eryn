@@ -7,6 +7,7 @@ from .distgen import DistributionGenerate
 from .distgenrj import DistributionGenerateRJ
 from .eigenaxis import EigenAxisMove
 from .flow import ConditionalFlowMove
+from .flowgaussian import FlowGaussianMove
 from .flownuts import FlowNUTSMove
 from .gaussian import GaussianMove
 from .group import GroupMove
@@ -57,5 +58,6 @@ __all__ = [
     "NUTSSampler",
     "IndependentProposalMove",
     "ConditionalFlowMove",
+    "FlowGaussianMove",
     "FlowNUTSMove",
 ]

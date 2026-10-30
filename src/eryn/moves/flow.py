@@ -374,14 +374,6 @@ class ConditionalFlowMove(MHMove):
         ``sample_and_log_prob`` / ``log_prob`` pair (both draws and both logq
         terms of that row's Hastings factor use the same scale).
         """
-        # Lazy import: FlowProposalDistribution is pure NumPy (no torch), but
-        # importing it here guarantees that even if eryn.flows.base were ever
-        # changed to pull in a backend, this module stays torch-free at the
-        # top level.
-        from eryn.flows.base import FlowProposalDistribution
-
-        dist = FlowProposalDistribution(self.flow, condition=self.active_condition)
-
         if self.branch_name not in branches_coords:
             raise KeyError(
                 f"{type(self).__name__}: branch_name {self.branch_name!r} not in"
@@ -418,59 +410,80 @@ class ConditionalFlowMove(MHMove):
                 continue  # ConditionalFlowMove only proposes for its own branch
 
             where = np.where(branches_inds[name])
-            old_points = coords[where]
-            num = len(where[0])
-            if num == 0:
+            if len(where[0]) == 0:
                 continue
 
-            if self.active_betas is None:
-                # + log q(old): np.add.at so multi-leaf duplicate (temp, walker) indices
-                # accumulate instead of last-write-wins on repeated fancy-index +=.
-                # NaN logq values (e.g. from out-of-support old points) propagate into
-                # lnpdiff.  NaN comparisons are always False, so such proposals are
-                # unconditionally rejected — the "no-bias" claim in the class docstring
-                # relies on this IEEE-754 property rather than on an explicit NaN guard.
-                np.add.at(factors, where[:2], dist.logpdf(old_points))
-
-                # Draw and - log q(new): sample_and_log_prob avoids a second forward
-                # pass — the log-prob returned during sampling is reused directly.
-                # Same NaN-rejection applies if the flow returns NaN for new points.
-                new_points, logq_new = self.flow.sample_and_log_prob(
-                    num, context=self.active_condition
-                )
-                np.add.at(factors, where[:2], -logq_new)
-
-                q[name][where] = new_points
-            else:
-                # Temperature-scaled proposals: group rows by temperature (the
-                # first axis of `coords`, per the class docstring) and, per
-                # temperature t, propose from the SAME flow with
-                # base_scale = active_betas[t]**-0.5 — one sample call + one
-                # log_prob call per temperature (ntemps is small, <= a few).
-                # `mask` sub-selects `where`/`old_points` while preserving row
-                # order, so the final scatter below is identical in shape and
-                # ordering to the active_betas=None path above.
-                temp_of_row = where[0]
-                new_points = np.empty_like(old_points)
-                for t in range(coords.shape[0]):
-                    mask = temp_of_row == t
-                    num_t = int(mask.sum())
-                    if num_t == 0:
-                        continue
-                    s = float(self.active_betas[t]) ** -0.5
-                    idx_t = tuple(w[mask] for w in where[:2])
-
-                    logq_old_t = self.flow.log_prob(
-                        old_points[mask], context=self.active_condition, base_scale=s
-                    )
-                    np.add.at(factors, idx_t, logq_old_t)
-
-                    new_points_t, logq_new_t = self.flow.sample_and_log_prob(
-                        num_t, context=self.active_condition, base_scale=s
-                    )
-                    np.add.at(factors, idx_t, -logq_new_t)
-                    new_points[mask] = new_points_t
-
-                q[name][where] = new_points
+            q[name][where] = self._propose_from_flow(coords[where], where, factors)
 
         return q, factors
+
+    def _propose_from_flow(self, old_points, where, factors):
+        """Draw replacements for ``old_points`` from the flow and add their Hastings terms.
+
+        Args:
+            old_points (np.ndarray): ``(num, flow.dims)`` current points of the active rows.
+            where (tuple): ``np.where`` of the active rows; ``where[:2]`` are the
+                ``(temp, walker)`` indices the factors are accumulated on.
+            factors (np.ndarray): ``(ntemps, nwalkers)`` log-factors, updated in place with
+                ``+log q(old) - log q(new)``.
+
+        Returns:
+            np.ndarray: ``(num, flow.dims)`` new points, in the order of ``old_points``.
+
+        """
+        # Lazy import: FlowProposalDistribution is pure NumPy (no torch), but
+        # importing it here guarantees that even if eryn.flows.base were ever
+        # changed to pull in a backend, this module stays torch-free at the
+        # top level.
+        from eryn.flows.base import FlowProposalDistribution
+
+        num = len(old_points)
+        if self.active_betas is None:
+            dist = FlowProposalDistribution(self.flow, condition=self.active_condition)
+
+            # + log q(old): np.add.at so multi-leaf duplicate (temp, walker) indices
+            # accumulate instead of last-write-wins on repeated fancy-index +=.
+            # NaN logq values (e.g. from out-of-support old points) propagate into
+            # lnpdiff.  NaN comparisons are always False, so such proposals are
+            # unconditionally rejected — the "no-bias" claim in the class docstring
+            # relies on this IEEE-754 property rather than on an explicit NaN guard.
+            np.add.at(factors, where[:2], dist.logpdf(old_points))
+
+            # Draw and - log q(new): sample_and_log_prob avoids a second forward
+            # pass — the log-prob returned during sampling is reused directly.
+            # Same NaN-rejection applies if the flow returns NaN for new points.
+            new_points, logq_new = self.flow.sample_and_log_prob(
+                num, context=self.active_condition
+            )
+            np.add.at(factors, where[:2], -logq_new)
+        else:
+            # Temperature-scaled proposals: group rows by temperature (the
+            # first axis of the branch coords, per the class docstring) and, per
+            # temperature t, propose from the SAME flow with
+            # base_scale = active_betas[t]**-0.5 — one sample call + one
+            # log_prob call per temperature (ntemps is small, <= a few).
+            # `mask` sub-selects `where`/`old_points` while preserving row
+            # order, so the returned points line up with `old_points` exactly
+            # as in the active_betas=None path above.
+            temp_of_row = where[0]
+            new_points = np.empty_like(old_points)
+            for t in range(factors.shape[0]):
+                mask = temp_of_row == t
+                num_t = int(mask.sum())
+                if num_t == 0:
+                    continue
+                s = float(self.active_betas[t]) ** -0.5
+                idx_t = tuple(w[mask] for w in where[:2])
+
+                logq_old_t = self.flow.log_prob(
+                    old_points[mask], context=self.active_condition, base_scale=s
+                )
+                np.add.at(factors, idx_t, logq_old_t)
+
+                new_points_t, logq_new_t = self.flow.sample_and_log_prob(
+                    num_t, context=self.active_condition, base_scale=s
+                )
+                np.add.at(factors, idx_t, -logq_new_t)
+                new_points[mask] = new_points_t
+
+        return new_points

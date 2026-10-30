@@ -50,39 +50,10 @@ class GaussianMove(MHMove):
             "Please select from: {1}".format(mode, self.allowed_modes)
         )
         
-        self.all_proposal = {}
-        for name, cov in cov_all.items():
-            # Parse the proposal type.
-            try:
-                float(cov)
-
-            except TypeError:
-                cov = np.atleast_1d(cov)
-                if len(cov.shape) == 1:
-                    # A diagonal proposal was given.
-                    ndim = len(cov)
-                    proposal = _diagonal_proposal(np.sqrt(cov), factor, mode)
-
-                elif len(cov.shape) == 2 and cov.shape[0] == cov.shape[1]:
-                    # The full, square covariance matrix was given.
-                    ndim = cov.shape[0]
-                    if mode == "am":
-                        proposal = _adaptive_metropolis_proposal(cov, factor, "vector", prob_single_component=single_component_prob)
-                    else:
-                        proposal = _proposal(cov, factor, mode)
-
-                else:
-                    raise ValueError("Invalid proposal scale dimensions")
-
-            else:
-                # This was a scalar proposal.
-                ndim = None
-                if mode == "am":
-                    proposal = _adaptive_metropolis_proposal(cov, factor, "vector", prob_single_component=single_component_prob)
-                else:
-                    proposal = _isotropic_proposal(np.sqrt(cov), factor, mode)
-
-            self.all_proposal[name] = proposal
+        self.all_proposal = {
+            name: _make_proposal(cov, mode, factor, single_component_prob)
+            for name, cov in cov_all.items()
+        }
 
         super().__init__(**kwargs)
 
@@ -168,6 +139,36 @@ class GaussianMove(MHMove):
         return q, np.zeros((ntemps, nwalkers))
 
 
+
+def _make_proposal(cov, mode, factor=None, single_component_prob=0.0):
+    """Build the proposal object for one covariance (see :class:`GaussianMove` for the arguments).
+
+    Shared with :class:`eryn.moves.FlowGaussianMove`, which uses it for its Gaussian columns.
+    """
+    # Parse the proposal type.
+    try:
+        float(cov)
+
+    except TypeError:
+        cov = np.atleast_1d(cov)
+        if len(cov.shape) == 1:
+            # A diagonal proposal was given.
+            return _diagonal_proposal(np.sqrt(cov), factor, mode)
+
+        elif len(cov.shape) == 2 and cov.shape[0] == cov.shape[1]:
+            # The full, square covariance matrix was given.
+            if mode == "am":
+                return _adaptive_metropolis_proposal(cov, factor, "vector", prob_single_component=single_component_prob)
+            return _proposal(cov, factor, mode)
+
+        raise ValueError("Invalid proposal scale dimensions")
+
+    # This was a scalar proposal.
+    if mode == "am":
+        return _adaptive_metropolis_proposal(cov, factor, "vector", prob_single_component=single_component_prob)
+    return _isotropic_proposal(np.sqrt(cov), factor, mode)
+
+
 class _isotropic_proposal(object):
     allowed_modes = ["vector", "random", "sequential"]
 
@@ -175,8 +176,9 @@ class _isotropic_proposal(object):
         self.index = 0
         self.scale = scale
         
-        if isinstance(scale, float):
-            self.invscale = 1. / scale
+        if np.ndim(scale) < 2:
+            # isotropic (scalar) or diagonal (vector of standard deviations)
+            self.invscale = 1. / np.asarray(scale)
         else:
             self.invscale = np.linalg.inv(np.linalg.cholesky(scale))
 
