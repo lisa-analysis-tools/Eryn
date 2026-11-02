@@ -133,7 +133,7 @@ class GroupStretchMove(GroupMove, StretchMove):
 
             # use stretch to get new proposals
             newpos[name] = self.get_new_points(
-                name, s, c_temp, Ns, s.shape, i, random_number_generator
+                name, s, c_temp, Ns, s.shape, i, random_number_generator, s_inds=s_inds
             )
 
         # proper factors

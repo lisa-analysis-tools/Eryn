@@ -57,7 +57,7 @@ class RedBlueMove(Move, ABC):
         """
 
     @classmethod
-    def get_proposal(self, sample, complement, random, gibbs_ndim=None):
+    def get_proposal(self, sample, complement, random, gibbs_ndim=None, s_inds_all=None):
         """Make a proposal
 
         Args:
@@ -72,6 +72,8 @@ class RedBlueMove(Move, ABC):
                 the true dimension. If given as an array, must have shape ``(ntemps, nwalkers)``.
                 See the tutorial for more information.
                 (default: ``None``)
+            s_inds_all (dict, optional): Keys are ``branch_names``. Values are the ``inds``
+                np.ndarray[ntemps, nwalkers, nleaves_max] of ``sample``. (default: ``None``)
 
         Returns:
             tuple: Tuple contained proposal information.
@@ -216,7 +218,7 @@ class RedBlueMove(Move, ABC):
 
                 # Get the move-specific proposal.
                 q, factors = self.get_proposal(
-                    s, c, model.random, gibbs_ndim=gibbs_ndim
+                    s, c, model.random, gibbs_ndim=gibbs_ndim, s_inds_all=new_inds
                 )
 
                 # account for gibbs sampling
