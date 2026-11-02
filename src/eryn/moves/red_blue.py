@@ -198,13 +198,21 @@ class RedBlueMove(Move, ABC):
 
                 # need to trick stretch proposal into using the dimenionality associated
                 # with Gibbs sampling if it is being used
-                gibbs_ndim = 0
-                for brn, ir in zip(branch_names_run, inds_run):
-                    if ir is not None:
-                        gibbs_ndim += ir.sum()
-                    else:
-                        # nleaves * ndim
-                        gibbs_ndim += np.prod(state.branches[brn].shape[-2:])
+                # only the active leaves of the walkers in this split count,
+                # shape (ntemps, nwalkers_here)
+                gibbs_ndim = self.get_gibbs_ndim(
+                    branch_names_run,
+                    inds_run,
+                    {
+                        brn: np.take_along_axis(
+                            inds_going_for_proposal[brn],
+                            all_inds_shaped[:, :, None],
+                            axis=1,
+                        )
+                        for brn in branch_names_run
+                    },
+                    {brn: state.branches[brn].shape[-1] for brn in branch_names_run},
+                )
 
                 # Get the move-specific proposal.
                 q, factors = self.get_proposal(
