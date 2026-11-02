@@ -165,11 +165,6 @@ class RedBlueMove(Move, ABC):
                     for name in state.branches
                 }
 
-                # the actual inds for the subset
-                real_inds_subset = {
-                    name: new_inds[name] for name in inds_going_for_proposal
-                }
-
                 # actual coordinates of subset
                 temp_coords = {
                     name: np.take_along_axis(
@@ -274,7 +269,7 @@ class RedBlueMove(Move, ABC):
                     branch_supps=new_branch_supps,
                 )
 
-                self.fix_logp_gibbs(branch_names_run, inds_run, logp, real_inds_subset)
+                self.fix_logp_gibbs(branch_names_run, inds_run, logp, new_inds)
 
                 # Compute the lnprobs of the proposed position.
                 logl, new_blobs = model.compute_log_like_fn(

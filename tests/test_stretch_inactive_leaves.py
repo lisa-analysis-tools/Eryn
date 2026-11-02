@@ -100,6 +100,15 @@ class StretchInactiveLeavesTest(unittest.TestCase):
         leaves = sample_active(move, 1, gaussian_log_like, self.gauss_priors, np.zeros(2))
         self.assert_unit_variance(leaves)
 
+    def test_stretch_one_slot_per_gibbs_block_different_slots(self):
+        # ! each block runs while some walkers have no active leaf in it; those walkers must
+        # be rejected, not stored with log_prior = 0 (which biases their next move)
+        active = np.arange(NSLOTS) == (np.arange(NWALKERS) % NSLOTS)[:, None]
+        move = StretchMove(gibbs_sampling_setup=per_slot_setup("leaf", 2), live_dangerously=True)
+        leaves = sample_active(move, None, gaussian_log_like, self.gauss_priors, np.zeros(2),
+                               active=active)
+        self.assert_unit_variance(leaves)
+
     def test_group_stretch_all_slots_together(self):
         for n_active in (1, 2):
             leaves = sample_active(PoolGroupStretch(nfriends=1), n_active, gaussian_log_like,

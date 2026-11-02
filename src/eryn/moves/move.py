@@ -408,7 +408,7 @@ class Move(object):
             inds (dict): Dictionary of ``inds`` arrays for all branches.
 
         """
-        total_leaves = np.zeros_like(logp, dtype=int)
+        total_leaves = sum(inds_val.sum(axis=-1) for inds_val in inds.values())
         total_leaves_here = np.zeros_like(logp, dtype=int)
         for bnr, ir in zip(branch_names_run, inds_run):
             if ir is not None:
@@ -423,12 +423,7 @@ class Move(object):
             else:
                 tmp = inds[bnr]
 
-            total_leaves += tmp.sum(axis=-1)
             total_leaves_here += tmp.sum(axis=-1)
-
-        for name, inds_val in inds.items():
-            if name not in branch_names_run:
-                total_leaves += inds_val.sum(axis=-1)
 
         # adjust
         logp[(total_leaves != 0) & (total_leaves_here == 0)] = -np.inf  # no use in running because no change
