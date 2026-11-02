@@ -57,7 +57,7 @@ class RedBlueMove(Move, ABC):
         """
 
     @classmethod
-    def get_proposal(self, sample, complement, random, gibbs_ndim=None):
+    def get_proposal(self, sample, complement, random, gibbs_ndim=None, s_inds_all=None):
         """Make a proposal
 
         Args:
@@ -72,6 +72,8 @@ class RedBlueMove(Move, ABC):
                 the true dimension. If given as an array, must have shape ``(ntemps, nwalkers)``.
                 See the tutorial for more information.
                 (default: ``None``)
+            s_inds_all (dict, optional): Keys are ``branch_names``. Values are the ``inds``
+                np.ndarray[ntemps, nwalkers, nleaves_max] of ``sample``. (default: ``None``)
 
         Returns:
             tuple: Tuple contained proposal information.
@@ -163,11 +165,6 @@ class RedBlueMove(Move, ABC):
                     for name in state.branches
                 }
 
-                # the actual inds for the subset
-                real_inds_subset = {
-                    name: new_inds[name] for name in inds_going_for_proposal
-                }
-
                 # actual coordinates of subset
                 temp_coords = {
                     name: np.take_along_axis(
@@ -198,17 +195,25 @@ class RedBlueMove(Move, ABC):
 
                 # need to trick stretch proposal into using the dimenionality associated
                 # with Gibbs sampling if it is being used
-                gibbs_ndim = 0
-                for brn, ir in zip(branch_names_run, inds_run):
-                    if ir is not None:
-                        gibbs_ndim += ir.sum()
-                    else:
-                        # nleaves * ndim
-                        gibbs_ndim += np.prod(state.branches[brn].shape[-2:])
+                # only the active leaves of the walkers in this split count,
+                # shape (ntemps, nwalkers_here)
+                gibbs_ndim = self.get_gibbs_ndim(
+                    branch_names_run,
+                    inds_run,
+                    {
+                        brn: np.take_along_axis(
+                            inds_going_for_proposal[brn],
+                            all_inds_shaped[:, :, None],
+                            axis=1,
+                        )
+                        for brn in branch_names_run
+                    },
+                    {brn: state.branches[brn].shape[-1] for brn in branch_names_run},
+                )
 
                 # Get the move-specific proposal.
                 q, factors = self.get_proposal(
-                    s, c, model.random, gibbs_ndim=gibbs_ndim
+                    s, c, model.random, gibbs_ndim=gibbs_ndim, s_inds_all=new_inds
                 )
 
                 # account for gibbs sampling
@@ -264,7 +269,7 @@ class RedBlueMove(Move, ABC):
                     branch_supps=new_branch_supps,
                 )
 
-                self.fix_logp_gibbs(branch_names_run, inds_run, logp, real_inds_subset)
+                self.fix_logp_gibbs(branch_names_run, inds_run, logp, new_inds)
 
                 # Compute the lnprobs of the proposed position.
                 logl, new_blobs = model.compute_log_like_fn(

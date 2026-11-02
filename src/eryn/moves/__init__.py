@@ -3,14 +3,18 @@
 # from .de import DEMove
 # from .de_snooker import DESnookerMove
 from .combine import CombineMove
+from .de import DEMove, DESnookerMove
 from .distgen import DistributionGenerate
 from .distgenrj import DistributionGenerateRJ
 from .eigenaxis import EigenAxisMove
 from .gaussian import GaussianMove
 from .group import GroupMove
+from .groupde import GroupDEMove, GroupDESnookerMove
 from .groupstretch import GroupStretchMove
+from .infomatrix import InfoMatrixMove
 
 # from .kde import KDEMove
+from .leafpool import LeafPoolAMMove, LeafPoolMove, LeafPoolStretchMove
 from .mh import MHMove
 from .move import Move
 
@@ -34,6 +38,9 @@ __all__ = [
     "GaussianMove",
     "RedBlueMove",
     "StretchMove",
+    "DEMove",
+    "DESnookerMove",
+    "InfoMatrixMove",
     "DistributionGenerateRJ",
     "DistributionGenerate",
     "TemperatureControl",
@@ -45,4 +52,9 @@ __all__ = [
     "CombineMove",
     "NUTSMove",
     "NUTSSampler",
+    "GroupDEMove",
+    "GroupDESnookerMove",
+    "LeafPoolMove",
+    "LeafPoolAMMove",
+    "LeafPoolStretchMove",
 ]

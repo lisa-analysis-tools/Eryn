@@ -295,6 +295,38 @@ class Move(object):
             at_least_one_proposal,
         )
 
+    def get_gibbs_ndim(self, branch_names_run, inds_run, inds_going_for_proposal, ndims):
+        """Number of parameters actually moved by an ensemble proposal, per walker.
+
+        Only the active leaves (and, when Gibbs sampling, only the selected parameters
+        of the selected leaves) count. Inactive leaves are carried along by the proposal
+        but are not part of the target, so counting them (``nleaves_max * ndim``) gives
+        the wrong dimension in the stretch factor ``(ndim - 1) ln z``.
+
+        Args:
+            branch_names_run (list): List of branch names to run concurrently.
+            inds_run (list): List of ``inds`` arrays including Gibbs sampling information.
+            inds_going_for_proposal (dict): ``inds`` arrays of the walkers being proposed,
+                as returned by :func:`setup_proposals`. Values have shape
+                ``(ntemps, nwalkers, nleaves_max)``.
+            ndims (dict): Keys are ``branch_names`` and values are the number of
+                parameters per leaf.
+
+        Returns:
+            np.ndarray: Moved dimension with shape ``(ntemps, nwalkers)``.
+
+        """
+        gibbs_ndim = 0
+        for brn, ir in zip(branch_names_run, inds_run):
+            inds_here = np.asarray(inds_going_for_proposal[brn])
+            if ir is None:
+                # all parameters of the active leaves
+                gibbs_ndim = gibbs_ndim + inds_here.sum(axis=-1) * ndims[brn]
+            else:
+                # selected parameters of the active, selected leaves
+                gibbs_ndim = gibbs_ndim + (inds_here * ir.sum(axis=-1)).sum(axis=-1)
+        return gibbs_ndim
+
     def cleanup_proposals_gibbs(
         self,
         branch_names_run,
@@ -376,7 +408,7 @@ class Move(object):
             inds (dict): Dictionary of ``inds`` arrays for all branches.
 
         """
-        total_leaves = np.zeros_like(logp, dtype=int)
+        total_leaves = sum(inds_val.sum(axis=-1) for inds_val in inds.values())
         total_leaves_here = np.zeros_like(logp, dtype=int)
         for bnr, ir in zip(branch_names_run, inds_run):
             if ir is not None:
@@ -391,12 +423,7 @@ class Move(object):
             else:
                 tmp = inds[bnr]
 
-            total_leaves += tmp.sum(axis=-1)
             total_leaves_here += tmp.sum(axis=-1)
-
-        for name, inds_val in inds.items():
-            if name not in branch_names_run:
-                total_leaves += inds_val.sum(axis=-1)
 
         # adjust
         logp[(total_leaves != 0) & (total_leaves_here == 0)] = -np.inf  # no use in running because no change

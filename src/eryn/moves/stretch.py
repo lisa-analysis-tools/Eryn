@@ -91,7 +91,10 @@ class StretchMove(RedBlueMove):
 
         """
         # adjusts in place
-        if ndims_old == ndims_new:
+        if not isinstance(factors, np.ndarray):
+            # factors on the GPU
+            ndims_new = self.xp.asarray(ndims_new)
+        if np.all(ndims_old == ndims_new):
             return
         logzz = factors / (ndims_old - 1.0)
         factors[:] = logzz * (ndims_new - 1.0)
@@ -284,7 +287,7 @@ class StretchMove(RedBlueMove):
         return c_temp
 
     def get_new_points(
-        self, name, s, c_temp, Ns, branch_shape, branch_i, random_number_generator
+        self, name, s, c_temp, Ns, branch_shape, branch_i, random_number_generator, s_inds=None
     ):
         r"""Compute new proposed points for walkers moving along branch ``name``.
 
@@ -306,6 +309,8 @@ class StretchMove(RedBlueMove):
             branch_i (int): Index of current branch. On ``branch_i == 0``, draws
                 stretch scale factors :math:`z \sim g(z)`.
             random_number_generator (object): Random state instance (NumPy or CuPy RNG).
+            s_inds (xp.ndarray, optional): ``inds`` of ``s``, shape ``(ntemps, Ns, nleaves_max)``.
+                Inactive leaves are not moved and add no lift weights. (default: ``None``)
 
         Returns:
             xp.ndarray: New proposed coordinates with shape ``(ntemps, Ns, nleaves_max, ndim)``.
@@ -316,6 +321,8 @@ class StretchMove(RedBlueMove):
 
         """
         ntemps, nwalkers, nleaves_max, ndim_here = branch_shape
+        if s_inds is not None:
+            s_inds = self.xp.asarray(s_inds)[..., None]
 
         # only for the first branch do we draw for zz
         if branch_i == 0:
@@ -351,6 +358,8 @@ class StretchMove(RedBlueMove):
             moved = self._inds_run.get(name)
             if moved is not None:  # Gibbs split: only the parameters it moves count
                 log_ratio = self.xp.where(self.xp.asarray(moved)[:, inds], log_ratio, 0.0)
+            if s_inds is not None:  # inactive leaves add no lift weights
+                log_ratio = self.xp.where(s_inds, log_ratio, 0.0)
             lift["log_ratio"] = lift["log_ratio"] + log_ratio.sum(axis=(-2, -1))
 
         else:
@@ -365,12 +374,16 @@ class StretchMove(RedBlueMove):
                 xp=self.xp,
             )[name].reshape(ntemps, nwalkers, nleaves_max, ndim_here)
 
+        # ! inactive leaves keep their values: no density, but they can be friends of others
+        if s_inds is not None:
+            temp = self.xp.where(s_inds, temp, s)
+
         # get from gpu or not
         if self.use_gpu and not self.return_gpu:
             temp = temp.get()
         return temp
 
-    def get_proposal(self, s_all, c_all, random, gibbs_ndim=None, **kwargs):
+    def get_proposal(self, s_all, c_all, random, gibbs_ndim=None, s_inds_all=None, **kwargs):
         """Generate stretch proposal
 
         Args:
@@ -383,6 +396,8 @@ class StretchMove(RedBlueMove):
                 the true dimension. If given as an array, must have shape ``(ntemps, nwalkers)``.
                 See the tutorial for more information.
                 (default: ``None``)
+            s_inds_all (dict, optional): Keys are ``branch_names`` and values are the ``inds``
+                of ``s_all``. Only active leaves are moved. (default: ``None``)
 
         Returns:
             tuple: First entry is new positions. Second entry is detailed balance factors.
@@ -440,7 +455,8 @@ class StretchMove(RedBlueMove):
 
             # use stretch to get new proposals
             newpos[name] = self.get_new_points(
-                name, s, c_temp, Ns, s.shape, i, random_number_generator
+                name, s, c_temp, Ns, s.shape, i, random_number_generator,
+                s_inds=None if s_inds_all is None else s_inds_all[name],
             )
         # proper factors
         factors = (ndim - 1.0) * self.xp.log(self.zz)

@@ -377,7 +377,7 @@ class EnsembleSampler(object):
                     "periodic must be PeriodicContainer or dict if not None."
                 )
             elif isinstance(periodic, dict):
-                periodic = PeriodicContainer(periodic)
+                periodic = PeriodicContainer(periodic, key_order=self.key_order)
 
         # Parse the move schedule
         if moves is None:
@@ -1152,7 +1152,15 @@ class EnsembleSampler(object):
                     for repeat in range(self.num_repeats_in_model):
                         # Choose a random move
                         move = self._random.choice(self.moves, p=self.weights)
-
+                        
+                        # if i == 0: # To make sure that we first select the Fstat move
+                        #     move = self.moves[0]
+                        #     # breakpoint()
+                        # try:
+                        #     print("Current move is", move.name)
+                        # except AttributeError:
+                        #     pass
+                            
                         # Propose (in model)
                         state, accepted_out = move.propose(model, state)
                         accepted += accepted_out

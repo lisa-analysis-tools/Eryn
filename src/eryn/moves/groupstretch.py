@@ -23,6 +23,12 @@ class GroupStretchMove(GroupMove, StretchMove):
     For periodic parameters, this move uses the randomized lift proposal from
     :class:`StretchMove`, preserving detailed balance across periodic boundaries.
 
+    The stretch factor :math:`z^{N-1}` is the full acceptance factor only if the friend
+    of each leaf is chosen independently of the current position of that leaf. See
+    :class:`GroupMove` for how the friends should be set up, how often updating them
+    (``n_iter_update``) can bias the posterior, and ``freeze_after``, which makes the
+    move exact after burn-in.
+
     Args:
         lift_scale (double, optional): Width of the lift weights in units of the complement's
             circular standard deviation. (default: ``2.0``)
@@ -127,7 +133,7 @@ class GroupStretchMove(GroupMove, StretchMove):
 
             # use stretch to get new proposals
             newpos[name] = self.get_new_points(
-                name, s, c_temp, Ns, s.shape, i, random_number_generator
+                name, s, c_temp, Ns, s.shape, i, random_number_generator, s_inds=s_inds
             )
 
         # proper factors
