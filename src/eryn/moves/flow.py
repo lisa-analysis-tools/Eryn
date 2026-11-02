@@ -311,9 +311,11 @@ class ConditionalFlowMove(MHMove):
                 coordinates, or ``np.ndarray[nsteps, ntemps, nwalkers, nleaves_max, ndim]`` if the move is called from a multi-step context.
         """
         coords = branches_coords[self.branch_name]
-        
+        nwalkers, ndim = coords.shape[-3], coords.shape[-1]
+
+        # (n_snapshots, nwalkers, ndim): the walker axis is kept for submit_by_leaf overrides
         batch = {
-            leaf: coords[..., self.harvest_temp_index, :, leaf, :].reshape(-1, coords.shape[-1])
+            leaf: coords[..., self.harvest_temp_index, :, leaf, :].reshape(-1, nwalkers, ndim)
             for leaf in range(coords.shape[-2])
         }
 
@@ -325,12 +327,15 @@ class ConditionalFlowMove(MHMove):
 
         Args:
             batch (dict): Keys are leaf indices; values are
-                ``np.ndarray[n_samples, ndim]`` coordinates for that leaf.
+                ``np.ndarray[n_samples, ndim]`` coordinates for that leaf, or
+                ``np.ndarray[n_snapshots, nwalkers, ndim]`` (flattened to rows here).
         """
         if self.executor is None:
             return
-        
-        self.executor.submit(batch)
+
+        self.executor.submit(
+            {leaf: np.asarray(rows).reshape(-1, np.shape(rows)[-1]) for leaf, rows in batch.items()}
+        )
 
     # ------------------------------------------------------------------
     # MHMove interface

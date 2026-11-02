@@ -7,6 +7,7 @@ Torch-free at import time, like :mod:`eryn.moves.flow`.
 from __future__ import annotations
 
 import logging
+from collections import deque
 
 import numpy as np
 
@@ -58,8 +59,25 @@ class FlowGaussianMove(ConditionalFlowMove):
     :attr:`active_condition`) is re-estimated from the rows passed to
     :meth:`submit_by_leaf`, i.e. from the same chain history the flow is trained on.
     This is adaptive Metropolis: the kernel uses past states, the same kind of
-    adaptation as the online-trained flow. Periodic Gaussian columns are estimated
-    from their wrapped values.
+    adaptation as the online-trained flow.
+
+    The Gaussian columns are typically the multimodal ones (sky, orientation), with
+    jumps between modes left to other moves. Their covariance across all walkers would
+    include the distance between modes and size the steps to land between them, so when
+    the submitted rows keep the walker axis, ``(n_snapshots, nwalkers, ndim)``, the
+    estimate is the **within-mode covariance** over the last ``adapt_window`` submits:
+
+    1. each walker's trajectory is cut wherever it jumps (a step more than ``adapt_trim``
+       times the typical nonzero step in some column, e.g. a sky reflection or a
+       temperature swap); the spread within the pieces gives a length scale (narrower
+       than the mode, as consecutive snapshots are autocorrelated);
+    2. at each snapshot the walkers are grouped into modes by single linkage, split where
+       they are more than ``adapt_trim`` length scales apart, and the covariance is the
+       spread about each group's mean, pooled over groups and snapshots. Walkers at one
+       snapshot are close to independent, so it has no autocorrelation bias.
+
+    Periodic columns use wrapped differences throughout. Flat ``(n_samples, ndim)`` rows
+    give the plain covariance over all rows.
 
     Args:
         flow (eryn.flows.Flow): Conditional flow over the ``flow_params`` columns
@@ -84,6 +102,11 @@ class FlowGaussianMove(ConditionalFlowMove):
             :meth:`submit_by_leaf`. (default: ``False``)
         adapt_min_samples (int, optional): Fewest rows of a leaf used for an adaptation.
             (default: ``max(10 * nB, 2 * nB + 2)``)
+        adapt_window (int, optional): Number of recent submits per leaf pooled for the
+            within-mode covariance. (default: ``5``)
+        adapt_trim (float, optional): How many typical scales apart counts as another mode:
+            a walker step this many times the typical nonzero step cuts its trajectory, and
+            walkers this many length scales apart fall in different groups. (default: ``10``)
         flow_prob (float or None, optional): Probability that a row moves its flow columns
             (otherwise its Gaussian columns); ``None`` moves both halves jointly.
             (default: ``0.5``)
@@ -107,6 +130,8 @@ class FlowGaussianMove(ConditionalFlowMove):
         single_component_prob: float = 0.0,
         adapt_cov: bool = False,
         adapt_min_samples: int | None = None,
+        adapt_window: int = 5,
+        adapt_trim: float = 10.0,
         flow_prob: float | None = 0.5,
         executor=None,
         harvest_every: int = 1,
@@ -142,6 +167,11 @@ class FlowGaussianMove(ConditionalFlowMove):
         self.adapt_min_samples = (
             max(10 * self.nB, 2 * self.nB + 2) if adapt_min_samples is None else int(adapt_min_samples)
         )
+        if int(adapt_window) < 1 or adapt_trim <= 1.0:
+            raise ValueError(f"adapt_window must be >= 1 and adapt_trim > 1, got {adapt_window}, {adapt_trim}.")
+        self.adapt_window = int(adapt_window)
+        self.adapt_trim = float(adapt_trim)
+        self._adapt_history = {}  # leaf -> deque of (n_snapshots, nwalkers, ndim) submits
 
         # Gaussian proposal objects keyed by leaf (None: default for every leaf)
         self.gaussian_proposals = {}
@@ -189,37 +219,114 @@ class FlowGaussianMove(ConditionalFlowMove):
         """Adapt the Gaussian covariances (if enabled) and send the flow columns to the executor.
 
         Args:
-            batch (dict): Keys are leaf indices; values are ``(n_samples, ndim)`` full rows.
+            batch (dict): Keys are leaf indices; values are full rows, either
+                ``(n_samples, ndim)`` or ``(n_snapshots, nwalkers, ndim)``. With the walker
+                axis the adaptation uses the within-walker covariance (see the class docstring).
 
         Raises:
-            ValueError: If a value does not have ``ndim`` columns.
+            ValueError: If a value does not have ``ndim`` columns or is not 2-D/3-D.
 
         """
+        batch = {leaf: np.asarray(rows) for leaf, rows in batch.items()}
         for leaf, rows in batch.items():
-            if np.shape(rows)[-1] != self.ndim:
+            if rows.ndim not in (2, 3) or rows.shape[-1] != self.ndim:
                 raise ValueError(
-                    f"{type(self).__name__}: leaf {leaf} rows have {np.shape(rows)[-1]} columns,"
-                    f" expected the full ndim = {self.ndim}."
+                    f"{type(self).__name__}: leaf {leaf} rows have shape {rows.shape}, expected"
+                    f" (n_samples, {self.ndim}) or (n_snapshots, nwalkers, {self.ndim}) full rows."
                 )
 
         if self.adapt_cov:
             adapted = {}
             for leaf, rows in batch.items():
-                rows = np.asarray(rows)
-                if len(rows) < self.adapt_min_samples:
-                    continue
-                cov = np.atleast_2d(np.cov(rows[:, ~self.flow_params], rowvar=False))
-                # a tiny per-column relative jitter: well posed for collapsed walkers, scale-free
-                # across columns of very different size
-                cov += np.diag(1e-12 * np.diag(cov))
-                adapted[leaf] = cov
+                cov = self._within_walker_cov(leaf, rows) if rows.ndim == 3 else self._marginal_cov(rows)
+                if cov is not None:
+                    # a tiny per-column relative jitter: well posed for collapsed walkers,
+                    # scale-free across columns of very different size
+                    adapted[leaf] = cov + np.diag(1e-12 * np.diag(cov))
             if adapted:
                 self.update_covariance(adapted)
                 logger.debug(f"{type(self).__name__}: adapted the Gaussian covariance of leaves {sorted(adapted)}.")
 
-        super().submit_by_leaf(
-            {leaf: np.asarray(rows)[:, self.flow_params] for leaf, rows in batch.items()}
-        )
+        super().submit_by_leaf({leaf: rows[..., self.flow_params] for leaf, rows in batch.items()})
+
+    def _marginal_cov(self, rows):
+        """Covariance of the Gaussian columns over all ``(n_samples, ndim)`` rows, or None if too few."""
+        if len(rows) < self.adapt_min_samples:
+            return None
+        return np.atleast_2d(np.cov(rows[:, ~self.flow_params], rowvar=False))
+
+    def _within_walker_cov(self, leaf, snapshots):
+        """Within-mode covariance of the Gaussian columns over the rolling window, or None.
+
+        Args:
+            leaf (int): Leaf the snapshots belong to.
+            snapshots (np.ndarray): ``(n_snapshots, nwalkers, ndim)`` cold-chain snapshots.
+
+        """
+        history = self._adapt_history.get(leaf)
+        if history is None or history[0].shape[1] != snapshots.shape[1]:  # first or new nwalkers
+            history = self._adapt_history[leaf] = deque(maxlen=self.adapt_window)
+        history.append(snapshots)
+        x = np.concatenate(history, axis=0).astype(float)[..., ~self.flow_params]  # (n_snap, nwalkers, nB)
+        n_snap, nwalkers = x.shape[:2]
+        if n_snap < 2 or nwalkers < 2:
+            return None
+        wrap = self._wrap_gaussian_columns
+
+        # 1. a length scale: the spread of each walker's trajectory between jumps. A jump between
+        # modes (e.g. a SkyMove reflection, a temperature swap) is a step far larger than the
+        # typical nonzero one in some column. Consecutive snapshots are autocorrelated, so this
+        # is narrower than the mode; it only sets the unit for step 2.
+        step = wrap(np.diff(x, axis=0))
+        size = np.abs(step)
+        typical = np.array([np.median(c[c > 0]) if np.any(c > 0) else np.inf for c in size.reshape(-1, self.nB).T])
+        jump = np.any(size > self.adapt_trim * typical, axis=-1)  # (n_snap - 1, nwalkers)
+        step[jump] = 0.0
+        path = np.concatenate([np.zeros((1, nwalkers, self.nB)), np.cumsum(step, axis=0)]).reshape(-1, self.nB)
+        segment = np.concatenate([np.zeros((1, nwalkers), dtype=int), np.cumsum(jump, axis=0)])
+        label = (segment * nwalkers + np.arange(nwalkers)).ravel()
+        counts = np.bincount(label)
+        sums = np.zeros((len(counts), self.nB))
+        np.add.at(sums, label, path)
+        dev = path - (sums / np.maximum(counts, 1)[:, None])[label]
+        dof = len(path) - np.count_nonzero(counts)
+        if dof < 1:
+            return None
+        scale = np.sqrt(np.diag(dev.T @ dev) / dof)
+        scale = np.where(scale > 0, scale, np.inf)  # a column that never moved does not separate modes
+
+        # 2. the modes at each snapshot: single-linkage groups of walkers, split where they are more
+        # than adapt_trim length scales apart. The spread about each group's mean, pooled over
+        # groups and snapshots, is the within-mode covariance; walkers at one snapshot are close to
+        # independent, so it has no autocorrelation bias.
+        from scipy.cluster.hierarchy import fcluster, linkage
+
+        upper = np.triu_indices(nwalkers, 1)
+        devs, dof = [], 0
+        for xs in x:
+            dist = np.sqrt(np.sum((wrap(xs[:, None] - xs[None, :]) / scale) ** 2, axis=-1))[upper]
+            groups = fcluster(linkage(dist, "single"), t=self.adapt_trim, criterion="distance")
+            for g in np.unique(groups):
+                members = xs[groups == g]
+                rel = wrap(members - members[0])
+                devs.append(rel - rel.mean(axis=0))
+                dof += len(members) - 1
+        if dof < self.adapt_min_samples:
+            return None
+        dev = np.concatenate(devs)
+        return dev.T @ dev / dof
+
+    def _wrap_gaussian_columns(self, d):
+        """Map differences of the Gaussian columns (last axis) of periodic parameters to ``[-P/2, P/2)``."""
+        periods = getattr(self.periodic, "periods", {}).get(self.branch_name)
+        if periods is None or len(periods) == 0:
+            return d
+        cols = np.flatnonzero(~self.flow_params)
+        for ind, period in zip(self.periodic.inds_periodic[self.branch_name], periods):
+            j = np.searchsorted(cols, ind)
+            if j < len(cols) and cols[j] == ind:
+                d[..., j] = (d[..., j] + period / 2) % period - period / 2
+        return d
 
     def get_proposal(self, branches_coords, random, branches_inds=None, **kwargs):
         """Propose the flow columns from the flow and/or the other columns from the Gaussian walk.

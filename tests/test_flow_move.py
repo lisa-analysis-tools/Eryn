@@ -506,6 +506,17 @@ def test_flowmove_harvest_submits_cold_chain_per_leaf():
         np.testing.assert_array_equal(arr, branches["x"][0][:, leaf, :])
 
 
+def test_flowmove_submit_by_leaf_flattens_leading_axes():
+    """(n_snapshots, nwalkers, ndim) values reach the executor as (n_snapshots * nwalkers, ndim) rows."""
+    pytest.importorskip("torch")
+    ex = _StubExecutor(canned=None)
+    move = ConditionalFlowMove(_make_flow(seed=0), branch_name="x", executor=ex)
+    snaps = np.random.default_rng(0).standard_normal((3, 5, 2))
+    move.submit_by_leaf({0: snaps, 1: snaps[0]})
+    np.testing.assert_array_equal(ex.submits[-1][0], snaps.reshape(-1, 2))
+    np.testing.assert_array_equal(ex.submits[-1][1], snaps[0])
+
+
 def test_flowmove_hot_reload_advances_loaded_version_and_changes_outputs():
     """Serving newer weights via the stub hot-loads them and changes flow outputs."""
     pytest.importorskip("torch")

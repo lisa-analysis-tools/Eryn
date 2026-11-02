@@ -221,7 +221,7 @@ def test_adapt_cov_and_executor_slicing():
     np.testing.assert_array_equal(sent[0], rows0[:, MASK])
     np.testing.assert_array_equal(sent[1], rows1[:, MASK])
 
-    with pytest.raises(ValueError, match="full ndim"):
+    with pytest.raises(ValueError, match="full rows"):
         move.submit_by_leaf({0: rows0[:, MASK]})
 
 
@@ -231,6 +231,81 @@ def test_adapt_cov_without_executor():
     move.submit_by_leaf({0: rows})  # executor None: still adapts
     np.testing.assert_allclose(move.gaussian_proposal(0).scale, np.cov(rows[:, ~MASK], rowvar=False), rtol=1e-9)
     np.testing.assert_array_equal(move.gaussian_proposal(1).scale, np.eye(2))  # the default entry is kept
+
+
+def _two_mode_snapshots(rng, n_snap=20, nwalkers=40, sep=10.0, within=np.diag([0.04, 0.01])):
+    """(n_snap, nwalkers, 4) snapshots: half the walkers around B = (0, 0), half around (sep, -sep)."""
+    centres = np.zeros((nwalkers, 4))
+    centres[nwalkers // 2:, ~MASK] = [sep, -sep]
+    noise = np.zeros((n_snap, nwalkers, 4))
+    noise[..., ~MASK] = rng.multivariate_normal(np.zeros(2), within, size=(n_snap, nwalkers))
+    noise[..., MASK] = rng.standard_normal((n_snap, nwalkers, 2))
+    return centres + noise
+
+
+def test_within_walker_cov_ignores_mode_separation():
+    within = np.array([[0.04, 0.01], [0.01, 0.02]])
+    ex = _StubExecutor()
+    move = FlowGaussianMove(_make_flow(), "x", MASK, adapt_cov=True, executor=ex)
+    snaps = _two_mode_snapshots(np.random.default_rng(0), n_snap=200, within=within)
+
+    move.submit_by_leaf({0: snaps})
+    np.testing.assert_allclose(move.gaussian_proposal(0).scale, within, atol=0.004)
+    marginal = np.cov(snaps.reshape(-1, 4)[:, ~MASK], rowvar=False)
+    assert marginal[0, 0] > 500 * within[0, 0]  # what the flat estimate would have used
+    # the executor still receives flat rows of the flow columns
+    np.testing.assert_array_equal(ex.submits[-1][0], snaps.reshape(-1, 4)[:, MASK])
+
+
+def test_within_walker_cov_trims_a_walker_that_changed_mode():
+    within = np.diag([0.04, 0.01])
+    move = FlowGaussianMove(_make_flow(), "x", MASK, adapt_cov=True)
+    snaps = _two_mode_snapshots(np.random.default_rng(1), n_snap=100, within=within)
+    snaps[50:, 0, ~MASK] += [10.0, -10.0]  # walker 0 jumps to the other mode halfway
+    move.submit_by_leaf({0: snaps})
+    np.testing.assert_allclose(move.gaussian_proposal(0).scale, within, atol=0.004)
+
+
+def test_within_mode_cov_unbiased_for_sticky_walkers_that_jump_often():
+    """Autocorrelated walkers (AR(1), rho 0.95) that switch mode every ~5 snapshots: the spread
+    of one walker between jumps is far narrower than the mode, the estimate must not be."""
+    rng = np.random.default_rng(4)
+    within = np.array([[0.04, 0.01], [0.01, 0.02]])
+    chol = np.linalg.cholesky(within)
+    n_snap, nwalkers, rho, sep = 300, 40, 0.95, np.array([4.0, -4.0])
+    z = rng.standard_normal((nwalkers, 2)) @ chol.T
+    sign = np.where(np.arange(nwalkers) % 2 == 0, 1.0, -1.0)
+    snaps = np.zeros((n_snap, nwalkers, 4))
+    for s in range(n_snap):
+        z = rho * z + np.sqrt(1 - rho**2) * rng.standard_normal((nwalkers, 2)) @ chol.T
+        sign = np.where(rng.random(nwalkers) < 0.2, -sign, sign)  # a mode jump
+        snaps[s, :, ~MASK] = (sign[:, None] * sep + z).T
+        snaps[s, :, MASK] = rng.standard_normal((2, nwalkers))
+    move = FlowGaussianMove(_make_flow(), "x", MASK, adapt_cov=True)
+    move.submit_by_leaf({0: snaps})
+    np.testing.assert_allclose(move.gaussian_proposal(0).scale, within, rtol=0.2, atol=0.004)
+
+
+def test_within_walker_cov_wraps_periodic_columns():
+    within = np.diag([0.04, 0.01])
+    move = FlowGaussianMove(_make_flow(), "x", MASK, adapt_cov=True)
+    move.periodic = PeriodicContainer({"x": {1: 2 * np.pi}})  # Gaussian column 1 is an angle
+    snaps = _two_mode_snapshots(np.random.default_rng(2), n_snap=200, within=within, sep=0.0)
+    snaps[..., 1] = snaps[..., 1] % (2 * np.pi)  # walkers sit on the 0 / 2 pi boundary
+    move.submit_by_leaf({0: snaps})
+    np.testing.assert_allclose(move.gaussian_proposal(0).scale, within, atol=0.004)
+
+
+def test_within_walker_window_accumulates_and_resets():
+    move = FlowGaussianMove(_make_flow(), "x", MASK, adapt_cov=True, adapt_window=3, adapt_min_samples=1)
+    rng = np.random.default_rng(3)
+    for _ in range(5):
+        move.submit_by_leaf({0: _two_mode_snapshots(rng, n_snap=4)})
+    assert len(move._adapt_history[0]) == 3
+    move.submit_by_leaf({0: _two_mode_snapshots(rng, n_snap=4, nwalkers=10)})  # new ensemble size
+    assert len(move._adapt_history[0]) == 1
+    with pytest.raises(ValueError, match="adapt_window"):
+        FlowGaussianMove(_make_flow(), "x", MASK, adapt_cov=True, adapt_window=0)
 
 
 def test_cov_shape_checked():
