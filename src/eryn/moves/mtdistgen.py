@@ -1,6 +1,6 @@
 import numpy as np
 
-from eryn.moves import MHMove
+from .mh import MHMove
 from eryn.moves.multipletry import MultipleTryMove
 
 
