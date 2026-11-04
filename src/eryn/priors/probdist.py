@@ -244,9 +244,12 @@ class ProbDistContainer:
                 elif len(inds) == 1 and inds[0] not in keys:
                     continue
 
-            vals_in = x_arr[:, inds]
             if len(inds) == 1:
-                vals_in = vals_in[:,0]
+                vals_in = x_arr[:, int(inds[0])].copy()
+            elif np.all(np.diff(inds) == 1):
+                vals_in = x_arr[:, int(inds[0]):int(inds[-1]) + 1].copy()
+            else:
+                vals_in = x_arr[:, inds]
 
             deps = self._extract_dependencies(prior_i, x_arr, kwargs)
             all_kwargs = {**kwargs, **deps}

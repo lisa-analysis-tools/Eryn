@@ -64,10 +64,8 @@ class UniformDistribution(Prior):
 
     def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
-        out = self.xp.full_like(x_arr, -self.xp.inf, dtype=self.xp.float64)
-
-        mask = (x_arr >= self.minimum) & (x_arr <= self.maximum)
-        out[mask] = self.logpdf_val
+        inside = (x_arr >= self.minimum) & (x_arr <= self.maximum)
+        out = self.xp.where(inside, self.logpdf_val, -self.xp.inf).astype(self.xp.float64, copy=False)
 
         return self._to_device(out)
     
