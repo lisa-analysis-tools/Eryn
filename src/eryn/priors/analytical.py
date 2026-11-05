@@ -1,13 +1,13 @@
 """Module containing analytical priors.
 
-Priors that can be evaluated at any point in parameter space, and for which 
-we can draw samples from. This includes uniform, Gaussian, and log-uniform priors, 
-as well as any other prior for which the user can provide a logpdf and rvs method. 
+Priors that can be evaluated at any point in parameter space, and for which
+we can draw samples from. This includes uniform, Gaussian, and log-uniform priors,
+as well as any other prior for which the user can provide a logpdf and rvs method.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 import numpy as np
 from numpy.typing import ArrayLike
 
@@ -47,7 +47,7 @@ class UniformDistribution(Prior):
             **kwargs,
         )
 
-        self.pdf_val = 1.0 / self.width 
+        self.pdf_val = 1.0 / self.width
         self.logpdf_val = self.xp.log(self.pdf_val)
 
     def rvs(self, size: int | tuple[int, ...] = (1,), **kwargs) -> NDArrayLike:
@@ -68,8 +68,8 @@ class UniformDistribution(Prior):
         out = self.xp.where(inside, self.logpdf_val, -self.xp.inf).astype(self.xp.float64, copy=False)
 
         return self._to_device(out)
-    
-    
+
+
 class DeltaFunction(Prior):
     """Dirac delta function prior.
 
@@ -121,7 +121,7 @@ class DeltaFunction(Prior):
 
 class PowerLaw(UniformDistribution):
     """Generalized Power Law distribution.
-    
+
     Sampler space: Uniform in u = x^(alpha + 1).
     Physical space: x distributed as p(x) ~ x^alpha in [minimum, maximum].
 
@@ -155,8 +155,8 @@ class PowerLaw(UniformDistribution):
         self._inv_power = 1.0 / self._power
         self._log_abs_power = np.log(np.abs(self._power))
 
-        u_bound_1 = minimum ** self._power
-        u_bound_2 = maximum ** self._power
+        u_bound_1 = minimum**self._power
+        u_bound_2 = maximum**self._power
 
         super().__init__(
             minimum=min(u_bound_1, u_bound_2),
@@ -172,21 +172,21 @@ class PowerLaw(UniformDistribution):
         self.log_jacobian = self._jacobian
 
     def _forward(self, x_phys: NDArrayLike, **kwargs) -> NDArrayLike:
-        return x_phys ** self._power
+        return x_phys**self._power
 
     def _inverse(self, u_samp: NDArrayLike, **kwargs) -> NDArrayLike:
-        return u_samp ** self._inv_power
+        return u_samp**self._inv_power
 
     def _jacobian(self, x_phys: NDArrayLike, **kwargs) -> NDArrayLike:
         x_phys = self.xp.asarray(x_phys)
         valid_x = self.xp.where(x_phys > 0, x_phys, 1.0)
         out = self._log_abs_power + self.alpha * self.xp.log(valid_x)
         return self._to_device(out)
-    
+
 
 class LogUniform(UniformDistribution):
     """Log-Uniform distribution.
-    
+
     Sampler space: Uniform in u = ln(x) between [ln(minimum), ln(maximum)].
     Physical space: x distributed as p(x) ~ 1/x between [minimum, maximum].
 
@@ -239,7 +239,7 @@ class LogUniform(UniformDistribution):
 
 class CosineUniform(UniformDistribution):
     """Uniform in Cosine prior.
-    
+
     Used for angles such as inclinations (iota) or colatitudes.
     Sampler space: Uniform in u = cos(iota) in [-1, 1].
     Physical space: iota distributed as p(iota) ~ sin(iota) in [0, pi].
@@ -285,7 +285,7 @@ class CosineUniform(UniformDistribution):
 
 class SineUniform(UniformDistribution):
     """Uniform in Sine prior.
-    
+
     Used for angles such as latitudes, declinations, or elevations (beta).
     Sampler space: Uniform in u = sin(beta) in [-1, 1].
     Physical space: beta distributed as p(beta) ~ cos(beta) in [-pi/2, pi/2].
@@ -327,11 +327,11 @@ class SineUniform(UniformDistribution):
     def _jacobian(self, beta_phys: NDArrayLike, **kwargs) -> NDArrayLike:
         beta_phys = self.xp.asarray(beta_phys)
         return self._to_device(self.xp.log(self.xp.cos(beta_phys)))
-    
+
 
 class Log10Uniform(UniformDistribution):
     """Log10-Uniform distribution.
-    
+
     Sampler space: Uniform in u = log10(x) between [log10(minimum), log10(maximum)].
     Physical space: x distributed as p(x) ~ 1/x in [minimum, maximum].
 
@@ -382,11 +382,11 @@ class Log10Uniform(UniformDistribution):
         x_phys = self.xp.asarray(x_phys)
         out = -self.xp.log(x_phys) - self._log_log10
         return self._to_device(out)
-    
-    
+
+
 class UniformInVolume(PowerLaw):
     """Euclidean Volume prior.
-    
+
     Commonly used for distance (d).
     Sampler space: Uniform in u = d^3.
     Physical space: d distributed as p(d) ~ d^2.
@@ -411,7 +411,7 @@ class UniformInVolume(PowerLaw):
     ):
         if minimum < 0:
             raise ValueError("Distance cannot be negative.")
-            
+
         super().__init__(
             alpha=2.0,
             minimum=minimum,
@@ -425,7 +425,7 @@ class UniformInVolume(PowerLaw):
 
 class InverseUniform(PowerLaw):
     """Uniform in Inverse space.
-    
+
     Sampler space: Uniform in u = 1/x.
     Physical space: x distributed as p(x) ~ 1/x^2.
 
@@ -449,7 +449,7 @@ class InverseUniform(PowerLaw):
     ):
         if minimum <= 0:
             raise ValueError("InverseUniform minimum value must be strictly positive.")
-            
+
         super().__init__(
             alpha=-2.0,
             minimum=minimum,
@@ -506,6 +506,7 @@ class Gaussian(Prior):
 
 class Normal(Gaussian):
     """Synonym for the Gaussian distribution."""
+
     pass
 
 
@@ -553,22 +554,23 @@ class LogNormal(Prior):
         x_arr = self.xp.asarray(x)
         out = self.xp.full_like(x_arr, -self.xp.inf, dtype=self.xp.float64)
         mask = x_arr > self.minimum
-        
+
         valid_x = self.xp.where(mask, x_arr, 1.0)
         log_x = self.xp.log(valid_x)
-        
+
         log_prob = (
             -0.5 * ((log_x - self.mu) / self.sigma) ** 2
             - self.xp.log(valid_x * self.sigma)
             - self._log_sqrt_2pi
         )
         out[mask] = log_prob[mask]
-        
+
         return self._to_device(out)
 
 
 class LogGaussian(LogNormal):
     """Synonym for LogNormal prior."""
+
     pass
 
 
@@ -613,18 +615,93 @@ class Exponential(Prior):
         x_arr = self.xp.asarray(x)
         out = self.xp.full_like(x_arr, -self.xp.inf, dtype=self.xp.float64)
         mask = x_arr >= self.minimum
-        
+
         valid_x = self.xp.where(mask, x_arr, 0.0)
         out[mask] = -(valid_x / self.mu) - self._log_mu
-        
+
         return self._to_device(out)
 
     def cdf(self, x: ArrayLike, **kwargs: Any) -> NDArrayLike:
         x_arr = self.xp.asarray(x)
         out = self.xp.zeros_like(x_arr, dtype=self.xp.float64)
         mask = x_arr >= self.minimum
-        
+
         valid_x = self.xp.where(mask, x_arr, 0.0)
         out[mask] = 1.0 - self.xp.exp(-valid_x / self.mu)
-        
+
         return self._to_device(out)
+
+
+class GenericFunctionalDistribution(Prior):
+    """
+    Generic distribution class, based on user-provided callable functions for the probability density function (pdf) and the inverse cumulative density function (cdf).
+
+    Args:
+        pdf_function (callable): A callable function that computes the pdf of the distribution.
+        inv_cdf_function (callable): A callable function that computes the inverse cdf of the distribution.
+        minimum (float): The minimum value of the distribution's support.
+        maximum (float): The maximum value of the distribution's support.
+        name (str, optional): The name of the distribution. (default: None)
+        clip (bool, optional): If ``True``, clip the samples to the range [minimum, maximum]. If ``False``, samples outside this range will be returned as is. (default: ``True``)
+        use_cupy (bool, optional): If ``True``, use CuPy. If ``False`` use Numpy. The two callable functions must be compatible with the chosen array library. (default: ``False``)
+        return_gpu (bool, optional): If ``True``, return CuPy array. If ``False``, return Numpy array. (default: ``False``)
+    """
+
+    def __init__(
+        self,
+        pdf_function: Callable,
+        inv_cdf_function: Callable,
+        minimum: float,
+        maximum: float,
+        name: str = None,
+        clip: bool = True,
+        use_cupy: bool = False,
+        return_gpu: bool = False,
+        **kwargs,
+    ):
+
+        super().__init__(
+            name=name,
+            minimum=minimum,
+            maximum=maximum,
+            use_cupy=use_cupy,
+            return_gpu=return_gpu,
+            **kwargs,
+        )
+
+        self.pdf_function = pdf_function
+        self.inv_cdf_function = inv_cdf_function
+        self.clip = clip
+
+    def rvs(self, size: int | tuple[int, ...] = 1) -> NDArrayLike:
+        if not isinstance(size, int) and not isinstance(size, tuple):
+            raise ValueError("size must be an integer or tuple of ints.")
+
+        if isinstance(size, int):
+            size = (size,)
+
+        rand_unif = self.xp.random.rand(*size)
+
+        out = self.inv_cdf_function(rand_unif)
+
+        if self.clip:
+            out = self.xp.clip(out, self.minimum, self.maximum)
+
+        return self._to_device(out)
+
+    def pdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
+        out = self.pdf_function(x)
+    
+        return self._to_device(out)
+
+    def logpdf(self, x: ArrayLike, **kwargs) -> NDArrayLike:
+        out = self.xp.zeros_like(x)
+        out[(x >= self.minimum) & (x <= self.maximum)] = self.xp.log(
+            self.pdf_function(x[(x >= self.minimum) & (x <= self.maximum)])
+        )
+        out[(x < self.minimum) | (x > self.maximum)] = -np.inf
+
+        return self._to_device(out)
+
+    def copy(self):
+        return deepcopy(self)

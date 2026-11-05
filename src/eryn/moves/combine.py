@@ -66,6 +66,11 @@ class CombineMove(Move):
         return acceptance_fraction_out
 
     @property
+    def sub_moves(self):
+        """Constituent moves, with ``(move, weight)`` tuples unwrapped."""
+        return [move[0] if isinstance(move, tuple) else move for move in self.moves]
+
+    @property
     def temperature_control(self):
         """temperature controller"""
         return self._temperature_control

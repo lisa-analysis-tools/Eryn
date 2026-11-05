@@ -22,6 +22,7 @@ Welcome to Eryn's documentation!
    user/state
    user/backend
    user/moves
+   user/flows
    user/prior
    user/temper
    user/utils

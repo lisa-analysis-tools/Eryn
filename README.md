@@ -19,6 +19,18 @@ from eryn.ensemble import EnsembleSampler
 
 See [examples notebook](https://github.com/lisa-analysis-tools/Eryn/blob/main/examples/Eryn_tutorial.ipynb) for more info. You can also navigate the [Documentation](https://lisa-analysis-tools.github.io/Eryn/index.html) pages.
 
+### Normalizing-flow proposals
+
+Eryn ships an optional `eryn.flows` subpackage for normalizing-flow MCMC proposals: a flow is trained on samples that approximate the target (offline from a prior run, or online by harvesting the live cold chain) and is then used as an independence proposal with the exact log-density needed for a valid Metropolis-Hastings correction. The proposals themselves are `ConditionalFlowMove` and `IndependentProposalMove` in `eryn.moves`.
+
+The PyTorch backend (`ZukoFlow`, backed by [zuko](https://github.com/probabilists/zuko)) requires the optional `flow` extra:
+
+```
+pip install eryn[flow]
+```
+
+See the [flows documentation](https://mikekatz04.github.io/Eryn/user/flows.html) and the `examples/flow_proposal_benchmark.py` (offline) and `examples/flow_online_training_toy.py` (online) scripts.
+
 
 ### Prerequisites
 

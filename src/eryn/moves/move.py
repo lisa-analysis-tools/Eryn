@@ -455,6 +455,38 @@ class Move(object):
     sampler_id_rows = None
 
     @property
+    def sub_moves(self):
+        """Moves wrapped by this move. Empty for leaf moves.
+
+        Overriding this advertises that the returned moves maintain the
+        standard ``accepted`` / ``num_proposals`` counters, so
+        ``acceptance_fraction`` is meaningful on each of them. Diagnostics such
+        as :class:`eryn.utils.PlotContainer` walk this to report the acceptance
+        of every proposal in a nested move tree.
+
+        Returns:
+            list: Constituent moves. Empty for a move that wraps none.
+
+        """
+        return []
+
+    @property
+    def sub_moves(self):
+        """Moves wrapped by this move. Empty for leaf moves.
+
+        Overriding this advertises that the returned moves maintain the
+        standard ``accepted`` / ``num_proposals`` counters, so
+        ``acceptance_fraction`` is meaningful on each of them. Diagnostics such
+        as :class:`eryn.utils.PlotContainer` walk this to report the acceptance
+        of every proposal in a nested move tree.
+
+        Returns:
+            list: Constituent moves. Empty for a move that wraps none.
+
+        """
+        return []
+
+    @property
     def temperature_control(self):
         """Temperature controller"""
         return self._temperature_control

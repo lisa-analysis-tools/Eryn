@@ -333,6 +333,74 @@ def psrf(C, ndims, per_walker=False):
     R̂ = np.sqrt(var_θ / W)
     return R̂
 
+def walk_moves(moves, prefix="", _seen=None):
+    """Walk a (possibly nested) collection of moves depth-first.
+
+    Wrapper moves such as :class:`eryn.moves.CombineMove` expose their
+    constituents through :attr:`eryn.moves.Move.sub_moves`. This yields every
+    move in that tree together with a ``/``-separated path built from class
+    names, so diagnostics can report each proposal's acceptance separately.
+
+    Moves of the same class at the same level are disambiguated with a ``_0`` /
+    ``_1`` suffix; a class that appears once at its level keeps its bare name.
+    This is *not* the same convention as :attr:`eryn.ensemble.EnsembleSampler.all_moves`,
+    which suffixes ``_N`` onto every top-level move unconditionally (so even a
+    uniquely-named move becomes e.g. ``Foo_0`` there). Paths yielded here
+    cannot be joined directly to ``backend.move_keys``.
+
+    Args:
+        moves (list): Moves to walk. Entries may be ``(move, weight)`` tuples.
+        prefix (str, optional): Path prefix for the current level. Set during
+            recursion; callers pass nothing. (default: ``""``)
+        _seen (set, optional): ``id()`` values already visited, so a move
+            instance appearing twice in the tree is reported once rather than
+            recursed into forever. Set during recursion; callers pass nothing.
+            (default: ``None``)
+
+    Yields:
+        tuple: ``(path, move)`` for every move in the tree.
+
+    """
+    if _seen is None:
+        _seen = set()
+
+    # unwrap (move, weight) tuples, then drop instances already visited, before
+    # counting names -- otherwise a shared instance would inflate the
+    # disambiguation suffixes of moves that are actually reported. This has to
+    # check-and-add incrementally rather than filter-then-bulk-update _seen:
+    # a move repeated within this very sibling list must be caught by its
+    # second occurrence here, not only by an earlier call frame.
+    moves = [move[0] if isinstance(move, tuple) else move for move in moves]
+    unique = []
+    for move in moves:
+        if id(move) in _seen:
+            continue
+        _seen.add(id(move))
+        unique.append(move)
+    moves = unique
+
+    name_counts = {}
+    for move in moves:
+        name = move.__class__.__name__
+        name_counts[name] = name_counts.get(name, 0) + 1
+
+    used_counts = {}
+    for move in moves:
+        name = move.__class__.__name__
+        if name_counts[name] > 1:
+            index = used_counts.get(name, 0)
+            used_counts[name] = index + 1
+            name = f"{name}_{index}"
+
+        path = prefix + name
+        yield path, move
+
+        # getattr rather than attribute access: a third-party move that does
+        # not inherit from Move still walks cleanly as a leaf
+        yield from walk_moves(
+            getattr(move, "sub_moves", []), prefix=path + "/", _seen=_seen
+        )
+
 from typing import TYPE_CHECKING, TypeAlias, Union
 if TYPE_CHECKING:
     # Strict typing context: Pylance will use this branch.

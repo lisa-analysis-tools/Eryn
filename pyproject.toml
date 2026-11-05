@@ -53,6 +53,11 @@ dependencies = [
   "pytest>=9.1.1",
 ]
 
+optional-dependencies.flow = [
+  "torch>=2.1",
+  "zuko>=1.1",
+]
+
 optional-dependencies.doc = [
   "ipykernel",
   "ipython",
@@ -71,6 +76,11 @@ optional-dependencies.testing = [
   "corner",
   "chainconsumer",
   "scienceplots",                          # for runtime plots
+]
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
 
 [tool.pyproject-fmt]

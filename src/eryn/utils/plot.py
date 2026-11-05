@@ -4,27 +4,19 @@ from shutil import which
 import typing
 
 import corner
+import numpy as np
+import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib.colors import to_rgba
 from matplotlib.patches import Ellipse, Rectangle
 
 from eryn.utils.updates import UpdateStep
-from eryn.utils.utility import get_integrated_act, stepping_stone_log_evidence
+from eryn.utils.utility import get_integrated_act, stepping_stone_log_evidence, walk_moves
 
 DEFAULT_PALETTE = "icefire"
-
-try:
-    import scienceplots
-    plt.style.use(['science'])
-except (ImportError, ModuleNotFoundError, AttributeError):
-    pass
-
-# increase default font size
-mpl.rcParams.update({'font.size': 16})
 
 class Backend:
     """A placeholder Backend class for type hinting."""
@@ -38,7 +30,7 @@ def setup_plotting():
         pass
 
     # increase default font size
-    mpl.rcParams.update({'font.size': 16})
+    # mpl.rcParams.update({'font.size': 16})
 
     if which("latex"):
         mpl.rcParams.update({
@@ -52,6 +44,9 @@ def setup_plotting():
             "text.usetex": False,
         })
 
+class Backend:
+    """A placeholder Backend class for type hinting."""
+    pass
 
 def save_or_show(fig, filename=None):
     """
@@ -66,6 +61,172 @@ def save_or_show(fig, filename=None):
         plt.close(fig)
     else:
         plt.show()
+
+
+def move_acceptance_rates(accepted, num_proposals, mode="interval"):
+    """Derive acceptance rates from cumulative acceptance counters.
+
+    Moves keep cumulative counters, so a plain ratio is the acceptance since
+    the start of the run. That view lags: a proposal that only starts working
+    late shows as a slow rise rather than a step. Storing the counters rather
+    than the ratio lets either view be produced here.
+
+    Args:
+        accepted (np.ndarray): Cumulative accepted counts, shape
+            ``(nsteps, ntemps, nwalkers)``.
+        num_proposals (np.ndarray): Cumulative proposal counts, shape
+            ``(nsteps,)``.
+        mode (str, optional): ``"interval"`` for the rate within each interval
+            between plot calls, ``"cumulative"`` for the rate since the start
+            of the run. (default: ``"interval"``)
+
+    Returns:
+        np.ndarray: Acceptance rates, shape ``(nsteps, ntemps, nwalkers)``.
+            Entries where the move was never drawn are ``np.nan``, so the line
+            breaks rather than reading as a genuine zero acceptance.
+
+    Raises:
+        ValueError: ``mode`` is neither ``"interval"`` nor ``"cumulative"``.
+
+    """
+    accepted = np.asarray(accepted, dtype=float)
+    num_proposals = np.asarray(num_proposals, dtype=float)
+
+    if mode == "cumulative":
+        counts, totals = accepted, num_proposals[:, None, None]
+        drawn = totals > 0
+    elif mode == "interval":
+        counts = np.diff(accepted, axis=0, prepend=0.0)
+        totals = np.diff(num_proposals, prepend=0.0)[:, None, None]
+        # Cumulative counters are monotonic by construction, so a negative
+        # increment here means something external reset them underneath us
+        # (e.g. the same move instance handed to an EnsembleSampler, which
+        # zeroes `accepted` in place while preserving its shape -- FIX 1
+        # guards the shape-changing case, this is its silent sibling). Treat
+        # that interval as not-drawn instead of plotting a false negative
+        # acceptance rate.
+        drawn = (totals > 0) & (counts >= 0)
+    else:
+        raise ValueError(f"mode must be 'interval' or 'cumulative', got {mode!r}.")
+
+    # np.where evaluates both branches, so the denominator is guarded too --
+    # an unguarded division would still warn on the branch that is discarded
+    return np.where(drawn, counts / np.where(drawn, totals, 1.0), np.nan)
+
+
+def move_counters(move, _seen=None):
+    """Cumulative ``(accepted, num_proposals)`` for one move, or ``None``.
+
+    A move that keeps its own counters reports them directly. A wrapper that
+    does not is pooled from its children instead: :class:`eryn.moves.CombineMove`
+    overrides ``accepted`` to return its children's arrays (and its setter never
+    stores ``_accepted``, so reading it raises), and never increments
+    ``num_proposals``. Pooling sums counts rather than averaging fractions, so
+    children drawn at different rates are weighted correctly. The same move
+    instance can appear more than once in a subtree (shared between a wrapper
+    and one of its own descendants), so pooling tracks visited ids and counts
+    each instance once, the same guard :func:`eryn.utils.utility.walk_moves`
+    keeps for the same reason.
+
+    Args:
+        move (:class:`eryn.moves.Move`): Move to read.
+        _seen (set, optional): ``id()`` values already pooled within this call's
+            subtree. Set during recursion; callers pass nothing. (default:
+            ``None``)
+
+    Returns:
+        tuple or None: ``(accepted, num_proposals)`` with ``accepted`` of shape
+            ``(ntemps, nwalkers)``, or ``None`` when no counters are available
+            anywhere in this move's subtree. ``accepted`` is always a snapshot,
+            never a view: moves mutate their counters in place (``self.accepted
+            += ...``), so returning a view would alias every recorded history
+            entry to the same live buffer and collapse the whole history to
+            the final value.
+
+    """
+    if _seen is None:
+        _seen = set()
+    if id(move) in _seen:
+        return None
+    _seen.add(id(move))
+
+    try:
+        # np.array (not np.asarray) always copies, even when move.accepted is
+        # already a float64 ndarray -- see the snapshot note above.
+        accepted = np.array(move.accepted, dtype=float)
+        num_proposals = float(move.num_proposals)
+        if accepted.ndim == 2 and num_proposals > 0:
+            return accepted, num_proposals
+    except (AttributeError, ValueError, TypeError):
+        # counters not initialised, or an aggregating override such as
+        # CombineMove.accepted -- fall through to pooling
+        pass
+
+    pooled = [
+        counters
+        for counters in (
+            move_counters(child, _seen) for child in getattr(move, "sub_moves", [])
+        )
+        if counters is not None
+    ]
+    if not pooled:
+        return None
+
+    return (
+        np.sum([accepted for accepted, _ in pooled], axis=0),
+        float(np.sum([num_proposals for _, num_proposals in pooled])),
+    )
+
+
+def _tex_safe(label):
+    """Escape characters that break LaTeX rendering when ``text.usetex`` is on.
+
+    Move paths contain underscores once a class is disambiguated
+    (``MHMove_0``), which LaTeX reads as a subscript and rejects outside math
+    mode.
+    """
+    if not mpl.rcParams.get("text.usetex", False):
+        return label
+    return label.replace("_", r"\_")
+
+
+def move_tree_colors(paths, palette=None):
+    """Assign one hue family per top-level move, lightening with depth.
+
+    Args:
+        paths (list): Move paths as produced by
+            :func:`eryn.utils.utility.walk_moves`.
+        palette (str or list, optional): Seaborn palette for the top-level
+            moves. Default is ``'tab10'``.
+
+    Returns:
+        dict: ``path -> RGB tuple`` for every path given.
+
+    """
+    roots = []
+    for path in paths:
+        root = path.split("/")[0]
+        if root not in roots:
+            roots.append(root)
+
+    base_colors = sns.color_palette(
+        palette if palette is not None else "tab10", max(len(roots), 1)
+    )
+
+    colors = {}
+    for root, base in zip(roots, base_colors):
+        family = sorted(
+            (path for path in paths if path.split("/")[0] == root),
+            key=lambda path: (path.count("/"), path),
+        )
+        # reverse=True runs dark -> light so the root keeps the base hue; the
+        # +2 keeps the deepest entries away from white
+        shades = sns.light_palette(base, n_colors=len(family) + 2, reverse=True)
+        for path, shade in zip(family, shades):
+            colors[path] = shade
+
+    return colors
+
 
 def cov_ellipse(mean, cov, ax, n_std=1.0, **kwargs):
     """
@@ -847,32 +1008,118 @@ def plot_leaves_evolution(nleaves: np.ndarray,
     save_or_show(fig, filename)
 
 def plot_acceptance_fraction(steps: typing.Union[np.ndarray, list],
-                            total_acceptance_fraction: np.ndarray,
+                             total_acceptance_fraction: np.ndarray,
                              moves_acceptance_fraction: dict,
+                             moves_steps: dict = None,
+                             rate_label: str = 'Acceptance Fraction',
                              filename: str = None):
-    """
-    Plot the acceptance fraction for different moves over sampling steps.
+    """Plot the acceptance fraction of every move in the tree over sampling steps.
 
     Args:
+        steps (np.ndarray or list): Sampling steps for the total curve.
+        total_acceptance_fraction (np.ndarray): Total acceptance fraction,
+            shape ``(nsteps, ntemps, nwalkers)``.
+        moves_acceptance_fraction (dict): ``path -> (nsteps, ntemps, nwalkers)``
+            rates, keyed by the ``/``-separated paths from
+            :func:`eryn.utils.utility.walk_moves`. Nesting depth is styled with
+            the line style and a lighter shade of the top-level move's hue.
+        moves_steps (dict, optional): ``path -> (nsteps,)`` steps. Each path may
+            have its own history length, so it cannot share ``steps``. If
+            ``None``, ``steps`` is used for every path.
+        rate_label (str, optional): Y-axis label. Default ``'Acceptance Fraction'``.
+        filename (str, optional): If provided, saves the figure to this filename.
 
     """
-
     fig = plt.figure(figsize=(10, 6))
     # cold chain total acceptance fraction
-    plt.plot(steps, total_acceptance_fraction[:, 0].mean(axis=1), label='Total', color='black', linewidth=2)
-    
-    # skip if moves_acceptance_fraction is empty
+    plt.plot(steps, total_acceptance_fraction[:, 0].mean(axis=1), label='Total',
+             color='black', linewidth=2)
+
     if len(moves_acceptance_fraction) != 0:
-        for move, acc_fraction in moves_acceptance_fraction.items():
-            plt.plot(steps, acc_fraction[:, 0].mean(axis=1), marker='o', label=move)
+        paths = list(moves_acceptance_fraction)
+        colors = move_tree_colors(paths)
+        linestyles = ['-', '--', ':', '-.']
+
+        for path in paths:
+            depth = path.count('/')
+            x = steps if moves_steps is None else moves_steps[path]
+            # Leading spaces alone don't distinguish depths: text.usetex
+            # collapses them, so e.g. depth 1 and depth 2 would render as the
+            # same '- <name>' legend entry. Repeat the marker instead, which
+            # survives LaTeX rendering.
+            label = '- ' * depth + path.split('/')[-1]
+
+            plt.plot(x,
+                     moves_acceptance_fraction[path][:, 0].mean(axis=1),
+                     marker='o',
+                     markersize=3,
+                     color=colors[path],
+                     linestyle=linestyles[depth % len(linestyles)],
+                     alpha=max(0.4, 1.0 - 0.15 * depth),
+                     label=_tex_safe(label))
 
     plt.axhline(y=0.234, color='gray', linestyle='--', linewidth=1, alpha=0.7, label='0.234')
-    plt.legend()
+    plt.legend(fontsize=9)
     plt.xlabel('Sampler Iteration')
-    plt.ylabel('Acceptance Fraction')  
+    plt.ylabel(_tex_safe(rate_label))
     plt.title('Acceptance Fraction Over Time')
 
     save_or_show(fig, filename)
+
+
+def plot_move_tree_acceptance(moves_acceptance_fraction: dict,
+                               moves_steps: dict,
+                               parent_folder: str = ".",
+                               rate_label: str = "Acceptance Fraction"):
+    """Write one acceptance figure per wrapper move, showing its direct children.
+
+    A path is a wrapper when another path starts with ``path + "/"``. Output
+    lands in ``<parent_folder>/moves/<path>/acceptance_fraction.png``, so the
+    folder tree mirrors the move tree and documents how the moves are nested.
+
+    Args:
+        moves_acceptance_fraction (dict): ``path -> (nsteps, ntemps, nwalkers)``
+            rates.
+        moves_steps (dict): ``path -> (nsteps,)`` steps.
+        parent_folder (str, optional): Folder to write into. Default is the
+            current directory.
+        rate_label (str, optional): Y-axis label.
+
+    """
+    paths = list(moves_acceptance_fraction)
+
+    for path in paths:
+        prefix = path + "/"
+        children = [
+            other for other in paths
+            if other.startswith(prefix) and "/" not in other[len(prefix):]
+        ]
+        if not children:
+            continue
+
+        folder = os.path.join(parent_folder, "moves", *path.split("/"))
+        os.makedirs(folder, exist_ok=True)
+
+        colors = move_tree_colors(children)
+
+        fig = plt.figure(figsize=(10, 6))
+        for child in children:
+            plt.plot(moves_steps[child],
+                     moves_acceptance_fraction[child][:, 0].mean(axis=1),
+                     marker="o",
+                     markersize=3,
+                     color=colors[child],
+                     label=_tex_safe(child.split("/")[-1]))
+
+        plt.axhline(y=0.234, color="gray", linestyle="--", linewidth=1, alpha=0.7,
+                    label="0.234")
+        plt.legend(fontsize=10)
+        plt.xlabel("Sampler Iteration")
+        plt.ylabel(_tex_safe(rate_label))
+        plt.title(_tex_safe("Acceptance Fraction - " + path.split("/")[-1]))
+
+        save_or_show(fig, os.path.join(folder, "acceptance_fraction.png"))
+
 
 def plot_tempered_acceptance_fraction(steps: typing.Union[np.ndarray, list],
                             total_acceptance_fraction: np.ndarray,
@@ -1157,22 +1404,27 @@ def produce_tempering_plots(chain: dict,
 def produce_advanced_plots(steps: typing.Union[np.ndarray, list],
                            total_acceptance_fraction: np.ndarray,
                            moves_acceptance_fraction: dict,
+                           moves_steps: dict = None,
+                           rate_label: str = 'Acceptance Fraction',
                            palette: str = None,
                            iteration: int = 0,
                            chain: dict = None,
                            parent_folder: str = '.'):
     """
     Produce advanced diagnostic plots. These include:
-        
-    * autocorrelation time evolution per parameter per branch in the cold chain, 
-    * the comparison of the maximum autocorrelation  time in each branch against the number of steps, 
-    * the acceptance fraction evolution over steps in the cold chain (both overall and per move), 
+
+    * autocorrelation time evolution per parameter per branch in the cold chain,
+    * the comparison of the maximum autocorrelation  time in each branch against the number of steps,
+    * the acceptance fraction evolution over steps in the cold chain (both overall and per move),
     * the overall acceptance fraction evolution over steps per temperature.
-    
+
     Args:
         steps (Union[np.ndarray, list]): Array or list of sampling steps.
         total_acceptance_fraction (np.ndarray): Total acceptance fraction array of shape (nsteps, ntemps, nwalkers).
         moves_acceptance_fraction (Dict): Dictionary of acceptance fractions for different moves.
+        moves_steps (Dict, optional): Per-move-path sampling steps. Each path can
+            have its own history length, so it cannot share ``steps``.
+        rate_label (str, optional): Y-axis label for the acceptance plots.
         parent_folder (str, optional): Folder to save the plots. Default is current directory.
     """
 
@@ -1180,7 +1432,18 @@ def produce_advanced_plots(steps: typing.Union[np.ndarray, list],
         steps,
         total_acceptance_fraction,
         moves_acceptance_fraction,
+        moves_steps=moves_steps,
+        rate_label=rate_label,
         filename=os.path.join(parent_folder, f'acceptance_fraction.png')
+    )
+
+    plot_move_tree_acceptance(
+        moves_acceptance_fraction,
+        moves_steps
+        if moves_steps is not None
+        else {path: steps for path in moves_acceptance_fraction},
+        parent_folder=parent_folder,
+        rate_label=rate_label,
     )
 
     plot_tempered_acceptance_fraction(
@@ -1255,6 +1518,9 @@ class PlotContainer:
         tempering_palette (str or list, optional): Seaborn color palette name or list of colors for tempering plots. If None, it defaults to `icefire`.
         parent_folder (str, optional): Folder to save the plots. Default is current directory.
         discard (float, optional): Number of initial samples to discard from the chain before plotting. If between 0 and 1, it is treated as fraction of total samples. Default is 0.
+        move_rate_mode (str, optional): ``'interval'`` plots each move's acceptance
+            within the interval since the previous plot, ``'cumulative'`` plots it
+            since the start of the run. Default is ``'interval'``.
         stop (int, optional): Maximum number of steps to generate plots for. Default is 10000.
     """
     
@@ -1267,7 +1533,8 @@ class PlotContainer:
                  tempering_palette: str = None,
                  parent_folder: str = '.',
                  discard: float = 0,
-                 stop: int = int(1e4), 
+                 move_rate_mode: str = "interval",
+                 stop: int = int(1e4),
                  ):
         """
         Initialize the PlotContainer.
@@ -1300,7 +1567,12 @@ class PlotContainer:
 
         self.steps = []
         self.total_acceptance_fraction = None
-        self.move_acceptance_fractions = {}
+        # counters, not ratios: storing accepted/num_proposals separately lets
+        # either a per-interval or a cumulative rate be produced at plot time
+        self.move_accepted = {}
+        self.move_num_proposals = {}
+        self.move_steps = {}
+        self.move_rate_mode = move_rate_mode
 
         self.stop = stop
 
@@ -1324,6 +1596,52 @@ class PlotContainer:
     @overlay_covariance.setter
     def overlay_covariance(self, value):
         self._overlay_covariance = value
+
+    def _rates_by_path(self, mode):
+        """Acceptance rates per move path in the requested mode."""
+        return {
+            path: move_acceptance_rates(
+                np.array(accepted),
+                np.array(self.move_num_proposals[path]),
+                mode=mode,
+            )
+            for path, accepted in self.move_accepted.items()
+        }
+
+    @property
+    def move_acceptance_fractions(self):
+        """Cumulative acceptance fraction per move path, derived from the counters."""
+        return self._rates_by_path("cumulative")
+
+    def move_rates(self):
+        """Acceptance rates and steps per move path, in ``self.move_rate_mode``.
+
+        Returns:
+            tuple: ``(rates, steps)``, both dicts keyed by move path. ``rates``
+                values have shape ``(nsteps, ntemps, nwalkers)``.
+
+        """
+        return (
+            self._rates_by_path(self.move_rate_mode),
+            {path: np.array(step) for path, step in self.move_steps.items()},
+        )
+
+    def _collect_move_acceptance(self, moves):
+        """Record the acceptance counters of every move in the tree.
+
+        Each path keeps its own step list. A move whose counters are not yet
+        initialised is skipped, so its history is shorter than ``self.steps``
+        and plotting it against that shared list would misalign it.
+        """
+        for path, move in walk_moves(moves):
+            counters = move_counters(move)
+            if counters is None:
+                continue
+
+            accepted, num_proposals = counters
+            self.move_accepted.setdefault(path, []).append(accepted)
+            self.move_num_proposals.setdefault(path, []).append(num_proposals)
+            self.move_steps.setdefault(path, []).append(self.backend.iteration)
 
     def produce_plots(self, sampler=None) -> None:
         """
@@ -1389,24 +1707,28 @@ class PlotContainer:
                 
                 if sampler is not None:
                     moves = sampler.moves
-                elif hasattr(self.backend, moves):
+                elif hasattr(self.backend, "moves"):
                     moves = self.backend.moves
                 else:
                     moves = None
 
                 if moves is not None:
-                    for move in moves:
-                        name = move.__class__.__name__
-                        if name not in self.move_acceptance_fractions:
-                            self.move_acceptance_fractions[name] = move.acceptance_fraction[np.newaxis, ...]
-                        else:
-                            self.move_acceptance_fractions[name] = np.vstack((self.move_acceptance_fractions[name], move.acceptance_fraction[np.newaxis, ...])) # shape (niterations, ntemps, nwalkers)
+                    self._collect_move_acceptance(moves)
 
                 full_chain = self.backend.get_chain(discard=0) if discard > 0 else chain
-                
+
+                move_rates, move_steps = self.move_rates()
+                rate_label = (
+                    'Acceptance Fraction (per interval)'
+                    if self.move_rate_mode == 'interval'
+                    else 'Acceptance Fraction (cumulative)'
+                )
+
                 produce_advanced_plots(steps=self.steps,
-                                        total_acceptance_fraction=self.total_acceptance_fraction,   
-                                        moves_acceptance_fraction=self.move_acceptance_fractions,
+                                        total_acceptance_fraction=self.total_acceptance_fraction,
+                                        moves_acceptance_fraction=move_rates,
+                                        moves_steps=move_steps,
+                                        rate_label=rate_label,
                                         palette=self.tempering_palette,
                                         iteration=self.backend.iteration,
                                         chain=full_chain,
