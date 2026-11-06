@@ -167,6 +167,7 @@ def save_corner_plot(
     out_dir: str,
     version: int,
     max_samples: int = 5000,
+    include_version: bool = False,
 ) -> list:
     """Corner-plot training samples against flow draws, one PNG per condition.
 
@@ -189,7 +190,8 @@ def save_corner_plot(
         a given round's plot is reproducible).
     max_samples : int, optional
         Cap on the number of points per data set in each plot.  Default 5000.
-
+    include_version : bool, optional
+        If ``True``, the version is included in the saved filename of each corner plot. Default ``False`` (title is just the condition).
     Returns
     -------
     list of str
@@ -235,10 +237,14 @@ def save_corner_plot(
             labels=["training samples", "flow samples"],
             loc="upper right",
         )
-
-        out_path = os.path.join(
-            out_dir, f"flow_corner_v{int(version):04d}_cond{int(cond)}.png"
-        )
+        if include_version:
+            out_path = os.path.join(
+                out_dir, f"flow_corner_v{int(version):04d}_cond{int(cond)}.png"
+            )
+        else:
+            out_path = os.path.join(
+                out_dir, f"flow_corner_cond{int(cond)}.png"
+            )
         fig.savefig(out_path, dpi=120)
         out_paths.append(out_path)
 
