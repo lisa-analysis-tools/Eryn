@@ -84,6 +84,18 @@ class ReversibleJumpMove(Move):
 
         """
 
+    def fix_logp_gibbs(self, branch_names_run, inds_run, logp, inds):
+        """Keep the prior of the proposed state as computed.
+
+        :meth:`Move.fix_logp_gibbs` sets ``logp = -inf`` for walkers with no leaves in
+        the branches being run while other branches have leaves: an in-model move has
+        nothing to change there. A reversible-jump proposal changes the leaf count, and
+        a death that empties the branches being run (allowed by ``nleaves_min = 0``) is
+        a valid model: its prior is the one of the remaining leaves (0 for none).
+        Rejecting it would make that model unreachable whenever another branch (e.g. a
+        fixed-dimension branch) has leaves.
+        """
+
     def get_proposal(
         self, all_coords, all_inds, nleaves_min_all, nleaves_max_all, random, **kwargs
     ):
