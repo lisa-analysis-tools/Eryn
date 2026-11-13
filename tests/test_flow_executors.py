@@ -1177,3 +1177,114 @@ def test_process_no_leftover_children():
     # If any earlier test leaked a child, this fails loudly.  (Runs last by
     # definition order within the module.)
     assert multiprocessing.active_children() == []
+
+
+# --------------------------------------------------------------------------
+# tune(): changing training settings of a live trainer
+# --------------------------------------------------------------------------
+
+
+class _CountingFlow(FakeFlow):
+    """FakeFlow whose weights also carry how many samples the last fit saw."""
+
+    def get_weights(self):
+        return {"scale": np.array(self.scale, dtype=np.float64), "n": np.array(self.last_fit_n)}
+
+
+def test_inline_tune_lets_the_buffer_grow_and_spaces_the_fits():
+    ex = InlineExecutor(_make_fake(), min_train_samples=0, max_buffer_samples=50)
+    for _ in range(10):
+        ex.submit({0: np.random.randn(20, 2)})
+    assert ex._flow.last_fit_n <= 50
+    fits = ex._flow.fit_count
+
+    ex.tune(max_buffer_samples=None, train_every=5)
+    kept = ex._buffered_total()  # what was buffered stays
+    for _ in range(10):
+        ex.submit({0: np.random.randn(20, 2)})
+    assert ex._buffered_total() == kept + 200  # no cap: the buffer grows
+    assert ex._flow.fit_count == fits + 2  # ten submits, a fit every fifth
+    assert ex._flow.last_fit_n == kept + 200
+
+
+def test_inline_tune_to_a_smaller_cap_trims_now():
+    ex = InlineExecutor(_make_fake(), min_train_samples=0, max_buffer_samples=None)
+    for _ in range(10):
+        ex.submit({0: np.random.randn(20, 2)})
+    assert ex._buffered_total() == 200
+    ex.tune(max_buffer_samples=60)
+    assert ex._buffered_total() == 60
+
+
+@pytest.mark.parametrize(
+    "changes, match",
+    [
+        ({"seed": 3}, "cannot change"),
+        ({"max_buffer_sample": 10}, "cannot change"),
+        ({"train_every": 0}, "positive integer"),
+        ({"max_buffer_samples": -5}, "positive integer"),
+        ({"fit_kwargs": {"verbose": True}}, "may not contain"),
+    ],
+)
+def test_tune_rejects_bad_changes_and_changes_nothing(changes, match):
+    ex = InlineExecutor(_make_fake(), min_train_samples=0, max_buffer_samples=50, train_every=2)
+    with pytest.raises(ValueError, match=match):
+        ex.tune(**{"min_train_samples": 5, **changes})  # the valid change is not applied either
+    assert (ex._max_buffer_samples, ex._train_every, ex._min_train_samples) == (50, 2, 0)
+
+
+def test_process_tune_before_start_and_validation():
+    ex = ProcessExecutor(_make_fake(), min_train_samples=50, max_buffer_samples=100, start=False)
+    try:
+        ex.tune(max_buffer_samples=None, train_every=4, epochs_per_round=3)
+        assert (ex._cfg.max_buffer_samples, ex._cfg.train_every, ex._cfg.epochs_per_round) == (None, 4, 3)
+        with pytest.raises(ValueError, match="cannot change"):
+            ex.tune(seed=1)
+        with pytest.raises(ValueError, match="cannot change"):
+            ex.tune(torch_num_threads=8)
+    finally:
+        ex.shutdown()
+
+
+def test_worker_takes_tuning_with_the_next_batch():
+    """The worker loop itself (in a thread, on plain queues): cap and cadence change mid-run."""
+    import queue as _queue
+    import threading
+
+    from eryn.flows.executors import FlowSpec as _FlowSpec, WorkerConfig, _trainer_worker
+
+    spec = _FlowSpec.from_flow(_CountingFlow(dims=2))
+    cfg = WorkerConfig(epochs_per_round=1, min_train_samples=1, max_buffer_samples=40)
+    sample_q, weights_q, control_q, stop = _queue.Queue(), _queue.Queue(), _queue.Queue(), threading.Event()
+    worker = threading.Thread(target=_trainer_worker, args=(spec, cfg, sample_q, weights_q, stop, control_q))
+    worker.start()
+    fits = []
+
+    def feed(n_batches):
+        """One batch at a time, each seen by the worker before the next (no coalescing)."""
+        for _ in range(n_batches):
+            sample_q.put({0: np.random.randn(20, 2)})
+            deadline = time.time() + 10.0
+            while not sample_q.empty() and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+            while not weights_q.empty():
+                msg = weights_q.get()
+                assert msg[0] == "weights", msg
+                fits.append(int(msg[2]["net"]["n"]))
+
+    try:
+        feed(4)
+        assert fits == [20, 40, 40, 40]  # a fit per batch, capped at 40
+
+        control_q.put({"max_buffer_samples": None, "train_every": 3})
+        feed(6)
+        assert fits[4:] == [100, 160]  # a fit every third batch, on a growing buffer
+
+        control_q.put({"max_buffer_samples": 60, "train_every": 1})
+        feed(1)
+        assert fits[-1] == 60  # trimmed to the new cap
+    finally:
+        sample_q.put(None)
+        worker.join(timeout=10.0)
+    assert not worker.is_alive()
