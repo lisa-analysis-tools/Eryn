@@ -53,7 +53,7 @@ import traceback
 import warnings
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -201,6 +201,35 @@ class FlowSpec:
         return flow
 
 
+def _positive_int_or_none(name: str, value, allow_none: bool) -> None:
+    if value is None and allow_none:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+        raise ValueError(
+            f"{name} must be a positive integer" + (" or None" if allow_none else "") + f", not {value!r}."
+        )
+
+
+def _validate_tuned(changes: dict) -> None:
+    """Value checks shared by the executors' ``tune`` (names are checked against ``TUNABLE``)."""
+    for name, allow_none in (
+        ("max_buffer_samples", True), ("refit_transform_every", True), ("train_every", False),
+        ("min_train_samples", False), ("epochs_per_round", False), ("save_every", False),
+        ("diagnostics_every", False),
+    ):
+        if name in changes:
+            _positive_int_or_none(name, changes[name], allow_none)
+    if "fit_kwargs" in changes:
+        reserved = {"refit_data_transform", "verbose"} & set(changes["fit_kwargs"] or {})
+        if reserved:
+            raise ValueError(f"fit_kwargs may not contain {sorted(reserved)}: the executor controls them.")
+
+
+def _over_cap(total: int, cap) -> bool:
+    """Whether a buffer of ``total`` samples is over ``cap`` (``None``: no cap, the buffer grows)."""
+    return cap is not None and total > cap
+
+
 class TrainerExecutor(ABC):
     """Non-blocking interface for online flow training.
 
@@ -226,6 +255,27 @@ class TrainerExecutor(ABC):
     Failures are surfaced loudly: once training has failed,
     :meth:`latest_weights` raises :class:`TrainerError`.
     """
+
+    #: The training settings :meth:`tune` may change on this executor.
+    TUNABLE: frozenset = frozenset()
+
+    def tune(self, **changes) -> None:
+        """Change training settings of a live trainer, e.g. ``tune(max_buffer_samples=None, train_every=10)``.
+
+        The changes apply from the next batch on; what is buffered and the trained weights are kept. Only the
+        settings in :attr:`TUNABLE` can be changed, and a name outside it raises ``ValueError`` (nothing is
+        changed then). A typical use is to let the buffer grow and to refit less often once the chain is
+        past its burn-in, so that the proposal depends less and less on the recent samples.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no tunable settings.")
+
+    def _check_tune(self, changes: dict) -> None:
+        unknown = sorted(set(changes) - self.TUNABLE)
+        if unknown:
+            raise ValueError(
+                f"{type(self).__name__}.tune: cannot change {unknown}; tunable: {sorted(self.TUNABLE)}."
+            )
+        _validate_tuned(changes)
 
     @abstractmethod
     def submit(self, samples_by_condition: dict) -> bool:
@@ -469,7 +519,8 @@ class InlineExecutor(TrainerExecutor):
         exceeds this, the oldest arrays are dropped from the left — but the most
         recent array is always retained whole, so a single submit larger than
         the cap is kept in full (the effective cap is
-        ``max(max_buffer_samples, one harvest)``).  Default is ``20_000``.
+        ``max(max_buffer_samples, one harvest)``).  ``None``: no cap, the buffer
+        grows with the run.  Default is ``20_000``.
     seed : int or None, optional
         Reserved for parity with asynchronous executors; unused by the inline
         implementation (the clone carries the template flow's own seed).
@@ -535,7 +586,7 @@ class InlineExecutor(TrainerExecutor):
             )
         self._train_every = int(train_every)
         self._min_train_samples = int(min_train_samples)
-        self._max_buffer_samples = int(max_buffer_samples)
+        self._max_buffer_samples = int(max_buffer_samples) if max_buffer_samples is not None else None
         self._refit_transform_every = (
             int(refit_transform_every) if refit_transform_every is not None else None
         )
@@ -583,9 +634,22 @@ class InlineExecutor(TrainerExecutor):
         """
         buf = self._buffers[condition]
         total = sum(len(a) for a in buf)
-        while total > self._max_buffer_samples and len(buf) > 1:
+        while _over_cap(total, self._max_buffer_samples) and len(buf) > 1:
             removed = buf.popleft()
             total -= len(removed)
+
+    TUNABLE = frozenset(
+        {"max_buffer_samples", "train_every", "min_train_samples", "refit_transform_every", "fit_kwargs"}
+    )
+
+    def tune(self, **changes) -> None:
+        self._check_tune(changes)
+        if "fit_kwargs" in changes:
+            self._fit_kwargs = dict(changes.pop("fit_kwargs") or {})
+        for name, value in changes.items():
+            setattr(self, "_" + name, value)
+        for condition in self._buffers:
+            self._trim(condition)
 
     def _buffered_total(self) -> int:
         """Total buffered samples summed over all conditions."""
@@ -869,7 +933,8 @@ class WorkerConfig:
 
     epochs_per_round: int = 20
     min_train_samples: int = 1000
-    max_buffer_samples: int = 20_000
+    max_buffer_samples: int | None = 20_000  # None: no cap
+    train_every: int = 1  # fit once this many batches have arrived since the last fit
     torch_num_threads: int = 2
     seed: int = 1234
     fit_kwargs: dict = field(default_factory=dict)
@@ -882,7 +947,7 @@ class WorkerConfig:
     corner_max_samples: int = 5000
 
 
-def _trainer_worker(spec, cfg, sample_q, weights_q, stop_event):
+def _trainer_worker(spec, cfg, sample_q, weights_q, stop_event, control_q=None):
     """Child-process training loop (module-level so it is spawn-importable).
 
     Rebuilds the flow from ``spec``, then loops: pull sample batches
@@ -958,8 +1023,24 @@ def _trainer_worker(spec, cfg, sample_q, weights_q, stop_event):
                 buf = buffers[cond]
                 buf.append(arr)
                 total = sum(len(a) for a in buf)
-                while total > cfg.max_buffer_samples and len(buf) > 1:
+                while _over_cap(total, cfg.max_buffer_samples) and len(buf) > 1:
                     total -= len(buf.popleft())
+
+        def _apply_tuning():
+            """Take the settings ``ProcessExecutor.tune`` sent; the buffers are trimmed to a new cap."""
+            nonlocal cfg
+            if control_q is None:
+                return
+            while True:
+                try:
+                    changes = control_q.get_nowait()
+                except queue.Empty:
+                    return
+                cfg = replace(cfg, **changes)
+                for buf in buffers.values():
+                    total = sum(len(a) for a in buf)
+                    while _over_cap(total, cfg.max_buffer_samples) and len(buf) > 1:
+                        total -= len(buf.popleft())
 
         def _buffered_total():
             return sum(len(a) for buf in buffers.values() for a in buf)
@@ -973,6 +1054,7 @@ def _trainer_worker(spec, cfg, sample_q, weights_q, stop_event):
 
         version = 0
         round_count = 0
+        batches_since_fit = 0  # for cfg.train_every
         transform_fitted = False
         # Per-round (version, val_nll) record feeding the trend plot.
         round_versions: list = []
@@ -984,7 +1066,9 @@ def _trainer_worker(spec, cfg, sample_q, weights_q, stop_event):
                 continue
             if item is None:  # sentinel: clean shutdown request
                 break
+            _apply_tuning()
             _buffer_item(item)
+            batches_since_fit += 1
 
             # Coalesce: drain everything else currently pending so we run ONE
             # fit over the union, rather than once per queued batch.
@@ -997,10 +1081,12 @@ def _trainer_worker(spec, cfg, sample_q, weights_q, stop_event):
                     stop_event.set()
                     break
                 _buffer_item(extra)
+                batches_since_fit += 1
 
             total = _buffered_total()
-            if total < cfg.min_train_samples or total == 0:
+            if total < cfg.min_train_samples or total == 0 or batches_since_fit < cfg.train_every:
                 continue
+            batches_since_fit = 0
 
             # Lazy fit-once-then-freeze, mirroring InlineExecutor: fit the
             # transform on the first round, freeze it after, and (if
@@ -1254,7 +1340,8 @@ class ProcessExecutor(TrainerExecutor):
         worker_device: str = "cpu",
         epochs_per_round: int = 20,
         min_train_samples: int = 1000,
-        max_buffer_samples: int = 20_000,
+        max_buffer_samples: int | None = 20_000,
+        train_every: int = 1,
         refit_transform_every: int | None = None,
         max_pending_batches: int = 4,
         drop_policy: str = "oldest",
@@ -1296,7 +1383,8 @@ class ProcessExecutor(TrainerExecutor):
         self._cfg = WorkerConfig(
             epochs_per_round=int(epochs_per_round),
             min_train_samples=int(min_train_samples),
-            max_buffer_samples=int(max_buffer_samples),
+            max_buffer_samples=int(max_buffer_samples) if max_buffer_samples is not None else None,
+            train_every=int(train_every),
             torch_num_threads=int(torch_num_threads),
             seed=int(seed),
             fit_kwargs=fit_kwargs,
@@ -1320,6 +1408,8 @@ class ProcessExecutor(TrainerExecutor):
         # (degenerate buffering state).  weights_q is tiny: we only ever need the
         # newest weights, and _put_drop_oldest keeps it from backing up.
         self._sample_q = self._CTX.Queue(maxsize=int(max_pending_batches))
+        # tune() messages: their own queue, so a full sample queue never evicts one
+        self._control_q = self._CTX.Queue()
         self._weights_q = self._CTX.Queue(maxsize=2)
         self._stop_event = self._CTX.Event()
 
@@ -1353,11 +1443,24 @@ class ProcessExecutor(TrainerExecutor):
         self._process = self._CTX.Process(
             target=_trainer_worker,
             args=(self._spec, self._cfg, self._sample_q, self._weights_q,
-                  self._stop_event),
+                  self._stop_event, self._control_q),
             daemon=True,  # last-resort no-zombie guarantee if the parent dies.
         )
         self._process.start()
         self._started = True
+
+    TUNABLE = frozenset({
+        "max_buffer_samples", "train_every", "min_train_samples", "epochs_per_round", "refit_transform_every",
+        "fit_kwargs", "save_every", "diagnostics_every", "plot_corner",
+    })
+
+    def tune(self, **changes) -> None:
+        self._check_tune(changes)
+        if "fit_kwargs" in changes:
+            changes["fit_kwargs"] = dict(changes["fit_kwargs"] or {})
+        self._cfg = replace(self._cfg, **changes)  # a worker not started yet starts with it
+        if self._started and not self._shutdown:
+            self._control_q.put(changes)  # the worker takes it with its next batch
 
     # ------------------------------------------------------------------
     # TrainerExecutor interface
@@ -1603,7 +1706,7 @@ class ProcessExecutor(TrainerExecutor):
 
         # Drain both queues BEFORE cancelling join threads so nothing is left to
         # flush, then cancel so teardown is non-blocking.
-        for q in (self._sample_q, self._weights_q):
+        for q in (self._sample_q, self._weights_q, self._control_q):
             while True:
                 try:
                     q.get_nowait()
