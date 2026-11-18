@@ -907,7 +907,6 @@ def plot_tempered_acceptance_fraction(steps: typing.Union[np.ndarray, list],
     ax.text(legend_x + legend_width + 0.01, legend_y + legend_height / 2, r'$T_0$',
             transform=ax.transAxes, ha='left', va='center', fontsize=11, fontweight='normal', antialiased=True)
 
-    plt.legend()
     plt.xlabel('Sampler Iteration')
     plt.ylabel('Acceptance Fraction')  
 
