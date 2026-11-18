@@ -68,7 +68,8 @@ def save_checkpoint(flow, save_path: str, version: int, val_nll=None) -> str:
     return str(save_path)
 
 
-def save_loss_plot(history, out_dir: str, version: int, val_nll=None) -> str:
+
+def save_loss_plot(history, out_dir: str, version: int, val_nll=None, include_version: bool = False) -> str:
     """Plot one training round's loss curves to ``flow_loss_v<version>.png``.
 
     Parameters
@@ -116,7 +117,9 @@ def save_loss_plot(history, out_dir: str, version: int, val_nll=None) -> str:
         ax.legend()
     fig.tight_layout()
 
-    out_path = os.path.join(out_dir, f"flow_loss_v{int(version):04d}.png")
+    savename = f"flow_loss_v{int(version):04d}.png" if include_version else "flow_loss.png"
+    out_path = os.path.join(out_dir, savename)
+
     fig.savefig(out_path, dpi=120)
     return out_path
 
